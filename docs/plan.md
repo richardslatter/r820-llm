@@ -58,7 +58,8 @@ Read-only bandwidth, AVX 256-bit loads, 48 sticks at 1333:
   - **Driver:** NVIDIA 580.178.04 (`nvidia-headless-580-server`, closed module). Quadro P2200 on PCIe 3.0 x16, attached to **NUMA node 1**.
   - **Two fixes were needed:** `/etc/modprobe.d/blacklist-nouveau.conf`, and an override `/etc/udev/rules.d/71-nvidia.rules` without the `modprobe -r` remove rules, which ping-ponged the driver when it was loaded live.
   - **CUDA 12.4** from Ubuntu's `nvidia-cuda-toolkit`; nvcc uses gcc-13 as its host compiler.
-- **Network:** avahi, so the server is `r820.local`. netplan uses `dhcp-identifier: mac` from the next boot.
+- **Network:** avahi, so the server is `r820.local`. netplan uses `dhcp-identifier: mac`, which took effect at the 2026-10-30 boot: the server is now **192.168.1.137**.
+  - `net-reconnect.service` (`system/net/`): booted without a cable (it's often on the iDRAC port)? It re-runs DHCP once a minute on any wired NIC with carrier until there's a default route, then exits.
 - **Builds:** `build-cpu` and `build-cuda` (sm_61) for both ik and mainline, under `~/src/*/`.
 - **Model in RAM:** `/mnt/models` is a 560 GB tmpfs, `mpol=interleave` and `huge=always`, not in fstab. It's filled by a one-off stream from the NAS: `nc -l 9000 | tar x` on the server, `tar c | nc -N` on the NAS. The NAS link is 1 GbE, ~117 MB/s, ~72 min for the Q8.
 
@@ -113,6 +114,16 @@ Greedy 16-token completion of a fixed prompt, 60 threads, `--numa distribute`, m
     - Policy 13 refuses host-side changes (`nm control disable per_policy 13` and re-adding it as disabled both return "Policy ID Invalid"), so the iDRAC owns it.
     - NM has **no inlet temperature** ("Invalid Mode"), and the iDRAC shows Inlet Temp "No Reading". The inlet sensor is on the front control panel, unplugged since the VLT0204 fix.
     - **Most likely cause:** the iDRAC holds a safe power level because it can't see inlet temperature. Less likely: PSU1 (the Hot Spare primary) has no AC.
+  - **Update (2026-10-30):** after pulling the dead PSU1 and an AC cycle, policy 13 reads **740 W** (was 343 W). Read over IPMI-over-LAN by the owner.
+    - The trigger was most likely the PSU state (PSU1 installed with no AC and set as the Hot Spare primary). The inlet sensor is still missing.
+    - `nm control disable global` is blocked by Dell: "Command subfunction disabled or unavailable (d6)".
+    - Hot Spare was then disabled (`racadm set System.Power.HotSpare.Enable Disabled`).
+    - **Fixed, verified 2026-10-30 00:18.** Sequence: AC cycle, dead PSU1 pulled, Hot Spare disabled, iDRAC user cap disabled, then a reboot.
+      - Node Manager now shows policies 1, 4 and 13 all "not enabled", and nothing is limiting in any domain.
+      - Under all-socket memory load: busy 97.6%, **2500 MHz**, CPU packages 292 W, DRAM 223 W (clamped: 400–1100 MHz, ~120 W, ~120 W).
+    - The iDRAC user cap was then disabled entirely (`Cap.Enable=Disabled`). `#Cap.ActivePolicy` still shows the last value (now 936 W, the maximum), so it's harmless even if it is still enforced.
+    - Measured full CPU load is ~630 W, so 740 W should no longer bind. It may clip with the GPU busy (+~75 W). Still to be verified under load from the OS.
+    - Front panel test: with the control-panel cable connected, the SEL logs "system board 5V PG voltage is outside of range" and "fail-safe voltage is outside of range", and Inlet Temp stays Unknown. So the panel loads the 5 V rail, and its sensor isn't seen either.
   - Also seen in `racadm get System.Power`: `HotSpare.Enable=Enabled` with `HotSpare.PrimaryPSU=PSU1` (the PSU with no AC), and `RedundancyPolicy=Not Redundant`. Left as is.
   - Not the cause: DIMM thermal throttling (~0 throttle cycles in the iMC counters), CPU temperature (≈60 °C), kernel threads, scheduler stacking.
 - **The other misleading result:** a leftover remote `sha256sum` kept running after the local task was stopped, which made all 64-thread runs ~10× slower until it was killed.

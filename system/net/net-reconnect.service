@@ -1,0 +1,11 @@
+[Unit]
+Description=Retry wired DHCP once a minute until the first connection
+After=systemd-networkd.service
+Wants=systemd-networkd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/net-reconnect.sh
+
+[Install]
+WantedBy=multi-user.target

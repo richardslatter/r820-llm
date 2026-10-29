@@ -32,6 +32,12 @@ racadm set System.Power.Cap.Watts 936                # = #Cap.MaxThreshold, so i
 
 To check from the OS, run turbostat under load: Bzy_MHz should stay near 2,600, not 400–1,100.
 
+**The second limiter: Intel Node Manager policy 13.** With the user cap at 936 W, an iDRAC-owned Node Manager policy still held the system at **343 W**:
+- `sudo ipmitool nm policy get policy_id 13 domain platform` shows it.
+- The host can't change it: per-policy disable returns "Policy ID Invalid", and global disable returns `d6`, "subfunction disabled".
+- What cleared it: an AC cycle with the dead PSU1 physically removed (it had been installed with no AC and set as the Hot Spare primary), Hot Spare disabled, the user cap disabled, and a reboot. Afterwards policies 1, 4 and 13 all read "not enabled", and cores hold 2,500 MHz under all-socket load.
+- The inlet sensor (front control panel) is still missing. Connecting the panel cable logs "system board 5V PG voltage is outside of range", so the panel stays unplugged.
+
 ## BIOS (2.7.0, the last release)
 
 Only one change was needed: System Profile from PerfPerWattOptimizedDapc to **PerfOptimized** (C-states and C1E off, processor power MaxPerf, turbo on). Already right: memory at 1333 (the ceiling for 3 dual-rank DIMMs per channel at 1.5 V), Optimizer mode, node interleave off, QPI at maximum, prefetchers on.
