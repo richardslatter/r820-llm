@@ -107,6 +107,12 @@ Greedy 16-token completion of a fixed prompt, 60 threads, `--numa distribute`, m
   - Short runs straight after idle escape the clamp for a few seconds (~530 W, 2.4 GHz, ~2.2–2.7 tok/s), which explains the bimodal results.
   - In-band changes are refused ("Power cap set feature is not enabled").
   - **Fixed via racadm (2026-10-30):** `System.Power.Cap.Enable` was already Disabled, yet `#Cap.ActivePolicy` (name "iDRAC") still enforced 433 W. The value can only be changed while the cap is enabled, so the fix was `racadm set System.Power.Cap.Enable Enabled` then `racadm set System.Power.Cap.Watts 936`. The active policy now reads 936 W (100% = `#Cap.MaxThreshold`), so it never binds. Under-load clocks are still to be verified from the OS.
+  - **That was not the whole story.** With the iDRAC cap at 936 W, sustained load still ran at 0.9–1.2 GHz, ~310 W system, 0.60 tok/s. Intel Node Manager (`ipmitool nm`, NM 2.5, in-band) shows the real limiter:
+    - platform **policy 13**: enabled, no trigger, **343 W**, 5 s correction, no T-states, non-volatile. It holds the system at ~335 W average (CPU domain ~143 W, memory ~108 W).
+    - policy 1 is the iDRAC user cap (now 936 W); policy 4 is 100 W on a missing power reading.
+    - Policy 13 refuses host-side changes (`nm control disable per_policy 13` and re-adding it as disabled both return "Policy ID Invalid"), so the iDRAC owns it.
+    - NM has **no inlet temperature** ("Invalid Mode"), and the iDRAC shows Inlet Temp "No Reading". The inlet sensor is on the front control panel, unplugged since the VLT0204 fix.
+    - **Most likely cause:** the iDRAC holds a safe power level because it can't see inlet temperature. Less likely: PSU1 (the Hot Spare primary) has no AC.
   - Also seen in `racadm get System.Power`: `HotSpare.Enable=Enabled` with `HotSpare.PrimaryPSU=PSU1` (the PSU with no AC), and `RedundancyPolicy=Not Redundant`. Left as is.
   - Not the cause: DIMM thermal throttling (~0 throttle cycles in the iMC counters), CPU temperature (≈60 °C), kernel threads, scheduler stacking.
 - **The other misleading result:** a leftover remote `sha256sum` kept running after the local task was stopped, which made all 64-thread runs ~10× slower until it was killed.
