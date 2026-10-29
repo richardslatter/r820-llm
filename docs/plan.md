@@ -131,6 +131,23 @@ Greedy 16-token completion of a fixed prompt, 60 threads, `--numa distribute`, m
   - `llama-bench` / `llama-sweep-bench` runs last long enough to always hit the clamp, which is why they read 0.6–0.9 tok/s.
   - All numbers so far are with the cap active; best unclamped readings: ik 2.2 tok/s (interleaved) and 2.71 (pinned + placed, llama-bench straight after the placement run).
 
+## First unclamped benchmarks (2026-10-30, power clamp fixed)
+
+llama-bench decode, Q8_0 dense weights (~12.7 GB/token), tmpfs on 4 KiB pages (`huge=never`), cores at 2.5 GHz:
+
+| Config | Decode tok/s |
+|---|---|
+| mainline, stock, 64 threads | 1.58 |
+| ik, stock, 64 threads (pages interleaved) | 2.60 |
+| ik, `GGML_NUMA_BLOCKED=1` (per-CPU pinning), interleaved | 2.66 |
+| **ik, pinned + `GGML_NUMA_PLACE=1`** (99.8–100% of every row quarter on its node) | **3.27** (tg32), 3.10 (tg64) |
+| ik, pinned + placed, 48 threads | 2.69 |
+| ik, pinned + placed, 32 threads (one per physical core) | 2.94 |
+
+- Prompt processing, pinned + placed, 64 threads: 8.2 tok/s (pp64).
+- NUMA-local placement: +26% over stock ik. ik: 2× mainline.
+- **3.27 tok/s × 12.7 GB ≈ 42 GB/s, against ~110 GB/s local bandwidth.** Decode is no longer memory-bound; the kernels (SIMDe-emulated AVX2 on AVX1) and per-op synchronisation are the bottleneck now. That is the Phase 3 custom-kernel work, which needs profiling first.
+
 ## Q8_0 quality and GPU offload (2026-10-30)
 
 - **Q8_0 dense weights are near-lossless.** ik perplexity (same 6 × 256 wikitext chunks): BF16 dense (as downloaded) 3.4907, Q8_0 dense 3.5081 (+0.5%, inside ±0.31).

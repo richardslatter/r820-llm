@@ -30,7 +30,8 @@ This is a working log, not a polished project. The plan and all measurements are
 | iDRAC Node Manager policy 13 (343 W clamp) | fixed: pulled dead PSU1, Hot Spare off, cap off; cores hold 2.5 GHz under load |
 | GPU offload (dense on P2200, experts mmapped on CPU) | works with `LLAMA_OT_CPU_MMAP=1`; perplexity check pending |
 | Q8_0 vs BF16 dense quality | done: perplexity 3.5081 vs 3.4907 (+0.5%) |
-| tok/s: stock vs NUMA-local, thread counts, GPU offload | after the cap is off |
+| tok/s: stock vs NUMA-local, thread counts (CPU) | done: ik NUMA-local **3.27 tok/s** (stock ik 2.60, mainline 1.58) |
+| GPU offload speed | next, after the attention-sink fix |
 
 First runs (60 threads, stock placement, Q8_0 dense):
 - ik_llama.cpp: **2.31 tok/s** decode, 5.3 tok/s prompt.
