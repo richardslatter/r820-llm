@@ -88,6 +88,30 @@ Greedy 16-token completion of a fixed prompt, 60 threads, `--numa distribute`, m
   - `mxfp8_patch.py`: MXFP8 type, also applied to mainline.
   - `ds41_gguf_patch.py`: ik expects a different Engram GGUF layout. Same rolling-xor hash and maths, different key names; one shared table instead of per-layer tables; key and query gate weights folded into one tensor. The shim maps the Unsloth/mainline layout onto ik's.
 
+## Correctness, NUMA placement and the throttling problem (2026-10-29 evening)
+
+- **ik is correct on DeepSeek:** wikitext-2 perplexity (6 × 256 tokens, Q8_0 dense) is ik 3.5081 and mainline 3.5073, within ±0.32.
+- **Placement works:**
+  - Two fixes in `numa_pin_patch.py`:
+    - fault the range in (`MADV_POPULATE_READ`) before `mbind(MPOL_MF_MOVE)`, since the kernel only migrates pages a process has mapped;
+    - pin each blocked thread to one CPU (`GGML_NUMA_SKIP=n` leaves n CPUs per node to the OS).
+  - The tmpfs is remounted `huge=never`, and the expert and dense shards are split to 4 KiB pages (`splitpages.py`). An expert's row quarter is 1.6 MB, smaller than a 2 MB huge page.
+  - 4 KiB pages read as fast as 2 MB ones (109 vs 110 GB/s).
+  - The debugfs file-path split form returns EINVAL on these files; the pid/address form works.
+  - Measured with `placecheck.py` (move_pages): every expert and dense row quarter is **99.7–100% on its node**. The page move takes 209 s once and persists in tmpfs.
+- **Run-to-run speed swings (0.6–2.7 tok/s, same command) were the iDRAC power cap.** Under load the cores run at **430–1100 MHz effective** (turbostat APERF/MPERF):
+  - P-state pinned at the minimum (ratio 12), power-limit status active;
+  - RAPL throttled 50–80% of the time at only ~30 W per package, though MSR 0x610 says PL1 = 95 W, so the limit comes in over PECI;
+  - system at ~320 W.
+  - `ipmitool delloem powermonitor getpowerbudget` still shows **Power cap 433 W**, below the 545 W "minimum power". The earlier `ipmitool dcmi power deactivate` only cleared the DCMI side; DCMI now says no limit is set.
+  - Short runs straight after idle escape the clamp for a few seconds (~530 W, 2.4 GHz, ~2.2–2.7 tok/s), which explains the bimodal results.
+  - In-band changes are refused ("Power cap set feature is not enabled"), so it needs `racadm` with the cord on the iDRAC port: `System.Power.Cap.Enable` → Disabled.
+  - Not the cause: DIMM thermal throttling (~0 throttle cycles in the iMC counters), CPU temperature (≈60 °C), kernel threads, scheduler stacking.
+- **The other misleading result:** a leftover remote `sha256sum` kept running after the local task was stopped, which made all 64-thread runs ~10× slower until it was killed.
+- **Tool notes:**
+  - `llama-bench` / `llama-sweep-bench` runs last long enough to always hit the clamp, which is why they read 0.6–0.9 tok/s.
+  - All numbers so far are with the cap active; best unclamped readings: ik 2.2 tok/s (interleaved) and 2.71 (pinned + placed, llama-bench straight after the placement run).
+
 ## Model facts (measured from the GGUF, 2026-10-29)
 
 Unsloth UD-Q8_K_XL: 474 GiB in 9 shards (SHA256 verified on the NAS), at `nas.local:/volume1/@home/richard/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-Q8_K_XL`. 40 layers, all MoE: 384 routed experts (6 active) plus 1 shared expert per layer. 4 hyper-connection streams (`embedding_length_out` 20480).

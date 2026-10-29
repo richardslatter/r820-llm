@@ -24,8 +24,10 @@ This is a working log, not a polished project. The plan and all measurements are
 | ik reads the Unsloth/mainline DeepSeek-V4.1 GGUF layout | done |
 | BF16 dense weights → Q8_0 (rewrite of one 17 GB shard) | done |
 | DeepSeek runs on both engines | done: ik 2.31 tok/s, mainline 1.22 (stock placement) |
-| ik vs mainline perplexity check | next |
-| tok/s: stock vs NUMA-local, thread counts, GPU offload | next |
+| ik vs mainline perplexity check | done: 3.5081 vs 3.5073 |
+| NUMA-local placement (4 KiB pages, per-CPU pinning) | done: 99.7–100% of every row quarter on its node |
+| **iDRAC 433 W power cap still enforced** (cores at 0.4–1.1 GHz under load) | blocking: needs racadm on the iDRAC port |
+| tok/s: stock vs NUMA-local, thread counts, GPU offload | after the cap is off |
 
 First runs (60 threads, stock placement, Q8_0 dense):
 - ik_llama.cpp: **2.31 tok/s** decode, 5.3 tok/s prompt.
@@ -46,6 +48,10 @@ Estimate: ~6.5 tok/s NUMA-local on the CPU; ~12 with the dense part on the GPU a
 | `ik_llama/ds41_gguf_patch.py` | Lets ik load DeepSeek-V4.1 GGUFs in the Unsloth/mainline layout |
 | `mainline/mxfp8.patch` | The MXFP8 change as applied to mainline llama.cpp |
 | `tools/requant_shard.c` | Requantizes the BF16 tensors of one GGUF shard, copying the rest |
+| `ik_llama/numa_pin_patch.py` | Follow-up to numa_patch.py: one CPU per thread, populate before mbind |
+| `tools/placecheck.py` | Reports which node each weight's row quarters actually sit on (move_pages) |
+| `tools/splitpages.py` | Splits tmpfs huge pages to 4 KiB in place (pid/address debugfs form) |
+| `tools/rd2.c`, `tools/rdfile.c`, `tools/clearpol.c` | Bandwidth tests (4 KiB vs 2 MB pages, tmpfs files), policy reset |
 | `tools/mmcheck.c` | ggml `mul_mat` / `mul_mat_id` checker against a double-precision reference |
 | `tools/gguf_tensors.py` | Dependency-free GGUF tensor lister (name, type, shape, bytes) |
 | `tools/rd.c` | Read-bandwidth benchmark (256-bit loads, OpenMP) |

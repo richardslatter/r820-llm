@@ -125,21 +125,22 @@ index 1e266581..e2c0b072 100644
  void dequantize_row_q6_0(const block_q6_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
  
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 368bc5e5..ab660ebf 100644
+index 368bc5e5..3b628b1f 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
-@@ -38,6 +38,10 @@
+@@ -38,6 +38,11 @@
  #include <float.h>
  #include <limits.h>
  #include <stdarg.h>
 +#if defined(__gnu_linux__)
++#include <sys/mman.h>
 +#include <sys/syscall.h>
 +#include <unistd.h>
 +#endif
  #include <signal.h>
  #if defined(__gnu_linux__)
  #include <syscall.h>
-@@ -617,6 +621,14 @@ static void ggml_vec_dot_f32(int n, float * restrict s, size_t bs, const float *
+@@ -617,6 +622,14 @@ static void ggml_vec_dot_f32(int n, float * restrict s, size_t bs, const float *
  static void ggml_vec_dot_f16(int n, float * restrict s, size_t bs, ggml_fp16_t * restrict x, size_t bx, ggml_fp16_t * restrict y, size_t by, int nrc);
  static void ggml_vec_dot_bf16(int n, float * restrict s, size_t bs, ggml_bf16_t * restrict x, size_t bx, ggml_bf16_t * restrict y, size_t by, int nrc);
  
@@ -154,7 +155,7 @@ index 368bc5e5..ab660ebf 100644
  static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
      [GGML_TYPE_I8] = {
          .type_name                = "i8",
-@@ -686,7 +698,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -686,7 +699,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .from_float               = quantize_row_q2_0,
          .from_float_ref           = (ggml_from_float_t) quantize_row_q2_0_ref,
          .vec_dot                  = ggml_vec_dot_q2_0_q8_0,
@@ -163,7 +164,7 @@ index 368bc5e5..ab660ebf 100644
          .vec_dot_type             = GGML_TYPE_Q8_2_X4,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_0_X4,
-@@ -704,7 +716,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -704,7 +717,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .from_float_ref           = (ggml_from_float_t) quantize_row_q4_0_ref,
          .vec_dot                  = ggml_vec_dot_q4_0_q8_0,
  #if GGML_USE_IQK_MULMAT
@@ -172,7 +173,7 @@ index 368bc5e5..ab660ebf 100644
          .vec_dot_type             = GGML_TYPE_Q8_2_X4,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_0_X4,
-@@ -729,7 +741,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -729,7 +742,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .from_float_ref           = (ggml_from_float_t) quantize_row_q4_1_ref,
          .vec_dot                  = ggml_vec_dot_q4_1_q8_1,
  #if GGML_USE_IQK_MULMAT
@@ -181,7 +182,7 @@ index 368bc5e5..ab660ebf 100644
          .vec_dot_type             = GGML_TYPE_Q8_2_X4,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_1_X4,
-@@ -780,7 +792,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -780,7 +793,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .from_float_ref           = (ggml_from_float_t) quantize_row_q5_0_ref,
          .vec_dot                  = ggml_vec_dot_q5_0_q8_0,
  #if GGML_USE_IQK_MULMAT
@@ -190,7 +191,7 @@ index 368bc5e5..ab660ebf 100644
          .vec_dot_type             = GGML_TYPE_Q8_2_X4,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_0_X4,
-@@ -801,7 +813,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -801,7 +814,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .from_float_ref           = (ggml_from_float_t) quantize_row_q5_1_ref,
          .vec_dot                  = ggml_vec_dot_q5_1_q8_1,
  #if GGML_USE_IQK_MULMAT
@@ -199,7 +200,7 @@ index 368bc5e5..ab660ebf 100644
          .vec_dot_type             = GGML_TYPE_Q8_2_X4,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_1_X4,
-@@ -822,7 +834,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -822,7 +835,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .from_float_ref           = (ggml_from_float_t) quantize_row_q6_0_ref,
          .vec_dot                  = ggml_vec_dot_q6_0_q8_0,
  #if GGML_USE_IQK_MULMAT
@@ -208,7 +209,7 @@ index 368bc5e5..ab660ebf 100644
          .vec_dot_type             = GGML_TYPE_Q8_2_X4,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_0_X4,
-@@ -844,7 +856,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -844,7 +857,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .from_float_to_mat        = quantize_mat_q8_0,
          .vec_dot                  = ggml_vec_dot_q8_0_q8_0,
  #if GGML_USE_IQK_MULMAT
@@ -217,7 +218,7 @@ index 368bc5e5..ab660ebf 100644
          .vec_dot_type             = GGML_TYPE_Q8_2_X4,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_0_X4,
-@@ -961,7 +973,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -961,7 +974,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .from_float               = quantize_row_q4_K,
          .from_float_ref           = (ggml_from_float_t) quantize_row_q4_K_ref,
          .vec_dot                  = ggml_vec_dot_q4_K_q8_K,
@@ -226,7 +227,7 @@ index 368bc5e5..ab660ebf 100644
          .vec_dot_type             = GGML_TYPE_Q8_2_X4,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_1_X4,
-@@ -991,7 +1003,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -991,7 +1004,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .from_float               = quantize_row_q5_K,
          .from_float_ref           = (ggml_from_float_t) quantize_row_q5_K_ref,
          .vec_dot                  = ggml_vec_dot_q5_K_q8_K,
@@ -235,7 +236,7 @@ index 368bc5e5..ab660ebf 100644
          .vec_dot_type             = GGML_TYPE_Q8_2_X4,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_1_X4,
-@@ -1021,7 +1033,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -1021,7 +1034,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .from_float               = quantize_row_q6_K,
          .from_float_ref           = (ggml_from_float_t) quantize_row_q6_K_ref,
          .vec_dot                  = ggml_vec_dot_q6_K_q8_K,
@@ -244,7 +245,7 @@ index 368bc5e5..ab660ebf 100644
          .vec_dot_type             = GGML_TYPE_Q8_2_X4,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_0_X4,
-@@ -1308,7 +1320,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -1308,7 +1321,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .from_float               = quantize_row_iq4_nl,
          .from_float_ref           = (ggml_from_float_t)quantize_row_iq4_nl_ref,
          .vec_dot                  = ggml_vec_dot_iq4_nl_q8_0,
@@ -253,7 +254,7 @@ index 368bc5e5..ab660ebf 100644
          .vec_dot_type             = GGML_TYPE_Q8_2_X4,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_0_X4,
-@@ -1329,6 +1341,15 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -1329,6 +1342,15 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .nrows                    = 1,
          .row_meta_size            = 0,
      },
@@ -269,7 +270,7 @@ index 368bc5e5..ab660ebf 100644
      [GGML_TYPE_MXFP4] = {
          .type_name                = "mxfp4",
          .blck_size                = QK_MXFP4,
-@@ -1338,7 +1359,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -1338,7 +1360,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .from_float               = quantize_row_mxfp4,
          .from_float_ref           = (ggml_from_float_t)quantize_row_mxfp4_ref,
          .vec_dot                  = vec_dot_mxfp4_q8_0_x4,
@@ -278,7 +279,7 @@ index 368bc5e5..ab660ebf 100644
          .vec_dot_type             = GGML_TYPE_Q8_2_X4,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_0_X4,
-@@ -1355,7 +1376,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -1355,7 +1377,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .from_float               = quantize_row_mxfp4_r8,
          .from_float_ref           = (ggml_from_float_t)quantize_row_mxfp4_r8_ref,
          .vec_dot                  = vec_dot_mxfp4_r8_q8_2_x4,
@@ -287,7 +288,7 @@ index 368bc5e5..ab660ebf 100644
          .vec_dot_type             = GGML_TYPE_Q8_2_X4,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_0_X4,
-@@ -1385,7 +1406,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -1385,7 +1407,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .from_float               = quantize_row_iq4_ks_r4,
          .from_float_ref           = (ggml_from_float_t)quantize_row_iq4_ks_r4_ref,
          .vec_dot                  = vec_dot_iq4_ks_r4_q8_k,
@@ -296,7 +297,7 @@ index 368bc5e5..ab660ebf 100644
          .vec_dot_type             = GGML_TYPE_Q8_K32,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_K,
-@@ -1402,7 +1423,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -1402,7 +1424,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .from_float               = quantize_row_iq4_ks_r16,
          .from_float_ref           = (ggml_from_float_t)quantize_row_iq4_ks_r16_ref,
          .vec_dot                  = vec_dot_iq4_ks_r16_q8_0,
@@ -305,7 +306,7 @@ index 368bc5e5..ab660ebf 100644
  #ifdef HAVE_FANCY_SIMD
          .vec_dot_type             = GGML_TYPE_Q8_K,
  #else
-@@ -1441,7 +1462,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -1441,7 +1463,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .from_float               = quantize_row_iq5_ks_r4,
          .from_float_ref           = (ggml_from_float_t)quantize_row_iq5_ks_r4_ref,
          .vec_dot                  = vec_dot_iq5_ks_r4_q8_k,
@@ -314,7 +315,7 @@ index 368bc5e5..ab660ebf 100644
          .vec_dot_type             = GGML_TYPE_Q8_K32,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_K,
-@@ -1458,7 +1479,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -1458,7 +1480,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .from_float               = quantize_row_iq5_ks_r16,
          .from_float_ref           = (ggml_from_float_t)quantize_row_iq5_ks_r16_ref,
          .vec_dot                  = vec_dot_iq5_ks_r16_q8_0,
@@ -323,7 +324,7 @@ index 368bc5e5..ab660ebf 100644
  #ifdef HAVE_FANCY_SIMD
          .vec_dot_type             = GGML_TYPE_Q8_K,
  #else
-@@ -1695,7 +1716,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -1695,7 +1717,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .vec_dot                  = vec_dot_iq1_kt_q8_k,
  #ifdef HAVE_FANCY_SIMD
          .vec_dot_type             = GGML_TYPE_Q8_K,
@@ -332,7 +333,7 @@ index 368bc5e5..ab660ebf 100644
          .vec_dot_type             = GGML_TYPE_Q8_2_X4,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_0_X4,
-@@ -1714,7 +1735,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -1714,7 +1736,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .vec_dot                  = vec_dot_iq2_kt_q8_k,
  #ifdef HAVE_FANCY_SIMD
          .vec_dot_type             = GGML_TYPE_Q8_K,
@@ -341,7 +342,7 @@ index 368bc5e5..ab660ebf 100644
          .vec_dot_type             = GGML_TYPE_Q8_2_X4,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_0_X4,
-@@ -1733,7 +1754,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -1733,7 +1755,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .vec_dot                  = vec_dot_iq3_kt_q8_k,
  #ifdef HAVE_FANCY_SIMD
          .vec_dot_type             = GGML_TYPE_Q8_K,
@@ -350,7 +351,7 @@ index 368bc5e5..ab660ebf 100644
          .vec_dot_type             = GGML_TYPE_Q8_2_X4,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_0_X4,
-@@ -1757,7 +1778,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -1757,7 +1779,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .vec_dot                  = vec_dot_iq4_kt_q8_k,
  #ifdef HAVE_FANCY_SIMD
          .vec_dot_type             = GGML_TYPE_Q8_K,
@@ -359,7 +360,7 @@ index 368bc5e5..ab660ebf 100644
          .vec_dot_type             = GGML_TYPE_Q8_2_X4,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_0_X4,
-@@ -1774,7 +1795,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -1774,7 +1796,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .from_float               = quantize_row_q1_0_g128,
          .from_float_ref           = (ggml_from_float_t)quantize_row_q1_0_g128_ref,
          .vec_dot                  = vec_dot_q1_0_g128_q8_0,
@@ -368,7 +369,7 @@ index 368bc5e5..ab660ebf 100644
          .vec_dot_type             = GGML_TYPE_Q8_2_X4,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_0_X4,
-@@ -1984,7 +2005,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -1984,7 +2006,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .from_float_ref           = (ggml_from_float_t)quantize_row_iq4_nl_r4_ref,
          .vec_dot                  = vec_dot_iq4_nl_r4_q8_0,
  #if GGML_USE_IQK_MULMAT
@@ -377,7 +378,7 @@ index 368bc5e5..ab660ebf 100644
          .vec_dot_type             = GGML_TYPE_Q8_2_X4,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_0_X4,
-@@ -2018,7 +2039,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -2018,7 +2040,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .from_float_ref           = (ggml_from_float_t)quantize_row_q4_0_r8_ref,
          .vec_dot                  = vec_dot_q4_0_r8_q8_0,
  #if GGML_USE_IQK_MULMAT
@@ -386,7 +387,7 @@ index 368bc5e5..ab660ebf 100644
          .vec_dot_type             = GGML_TYPE_Q8_2_X4,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_0_X4,
-@@ -2039,7 +2060,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -2039,7 +2061,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .from_float_ref           = (ggml_from_float_t)quantize_row_q8_0_r8_ref,
          .vec_dot                  = vec_dot_q8_0_r8_q8_0,
  #if GGML_USE_IQK_MULMAT
@@ -395,7 +396,7 @@ index 368bc5e5..ab660ebf 100644
          .vec_dot_type             = GGML_TYPE_Q8_2_X4,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_0_X4,
-@@ -2060,7 +2081,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -2060,7 +2082,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .from_float_ref           = (ggml_from_float_t)quantize_row_q5_0_r4_ref,
          .vec_dot                  = vec_dot_q5_0_r4_q8_0,
  #if GGML_USE_IQK_MULMAT
@@ -404,7 +405,7 @@ index 368bc5e5..ab660ebf 100644
          .vec_dot_type             = GGML_TYPE_Q8_2_X4,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_0_X4,
-@@ -2081,7 +2102,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -2081,7 +2103,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .from_float_ref           = (ggml_from_float_t)quantize_row_q6_0_r4_ref,
          .vec_dot                  = vec_dot_q6_0_r4_q8_0,
  #if GGML_USE_IQK_MULMAT
@@ -413,7 +414,7 @@ index 368bc5e5..ab660ebf 100644
          .vec_dot_type             = GGML_TYPE_Q8_2_X4,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_0_X4,
-@@ -4027,6 +4048,36 @@ inline static __m128 ggml_v_softcap(__m128 x, float s_before, float s_after) {
+@@ -4027,6 +4049,36 @@ inline static __m128 ggml_v_softcap(__m128 x, float s_before, float s_after) {
      return _mm_mul_ps(th, _mm_set1_ps(s_after));
  }
  
@@ -450,23 +451,27 @@ index 368bc5e5..ab660ebf 100644
  #endif // __ARM_NEON / __AVX2__ / __SSE2__
  
  static void ggml_vec_silu_f32(const int n, float * y, const float * x) {
-@@ -4997,7 +5048,15 @@ static uint32_t ggml_get_numa_affinity(void) {
+@@ -4997,7 +5049,19 @@ static uint32_t ggml_get_numa_affinity(void) {
  }
  #endif
  
 +// GGML_NUMA_BLOCKED=1: distribute threads to nodes in contiguous blocks instead of round robin
 +static bool g_numa_blocked = false;
++// GGML_NUMA_SKIP=n: blocked threads start at cpu n of their node, leaving the first n to the OS
++static int  g_numa_skip    = 0;
 +
  void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
 +    {
 +        const char * e = getenv("GGML_NUMA_BLOCKED");
 +        g_numa_blocked = e && atoi(e) != 0;
++        const char * k = getenv("GGML_NUMA_SKIP");
++        g_numa_skip = k ? atoi(k) : 0;
 +    }
 +
      if (g_state.numa.n_nodes > 0) {
          fprintf(stderr, "ggml_numa_init: NUMA already initialized\n");
  
-@@ -18819,6 +18878,28 @@ static void ggml_compute_forward_mul_mat_id(
+@@ -18819,6 +18883,28 @@ static void ggml_compute_forward_mul_mat_id(
              if (matrix_row_counts[a] > 0) total_chunks += chunks_per_expert;
          }
  
@@ -495,7 +500,7 @@ index 368bc5e5..ab660ebf 100644
          int chunk_id = ith;
          while (chunk_id < total_chunks) {
              // Map global chunk_id to (expert_index, local_chunk_index)
-@@ -19156,6 +19237,42 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
+@@ -19156,6 +19242,42 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
          if (matrix_row_counts[a] > 0) total_chunks_ug += chunks_per_expert_ug;
      }
  
@@ -538,7 +543,7 @@ index 368bc5e5..ab660ebf 100644
      int last_a = 0;
      int last_acc = 0;
      int chunk_id_ug = ith;
-@@ -20477,6 +20594,7 @@ static void ggml_compute_forward_get_rows(
+@@ -20477,6 +20599,7 @@ static void ggml_compute_forward_get_rows(
          case GGML_TYPE_Q6_0_R4:
          case GGML_TYPE_I2_S:
          case GGML_TYPE_Q8_0_R8:
@@ -546,7 +551,7 @@ index 368bc5e5..ab660ebf 100644
          case GGML_TYPE_MXFP4:
          case GGML_TYPE_MXFP4_R8:
          case GGML_TYPE_IQ4_XS:
-@@ -29188,7 +29306,7 @@ typedef int ggml_lock_t;
+@@ -29188,7 +29311,7 @@ typedef int ggml_lock_t;
  
  // Android's libc implementation "bionic" does not support setting affinity
  #if defined(__gnu_linux__)
@@ -555,7 +560,7 @@ index 368bc5e5..ab660ebf 100644
      if (!ggml_is_numa()) {
          return;
      }
-@@ -29200,7 +29318,8 @@ static void set_numa_thread_affinity(int thread_n) {
+@@ -29200,7 +29323,8 @@ static void set_numa_thread_affinity(int thread_n) {
      switch(g_state.numa.numa_strategy) {
          case GGML_NUMA_STRATEGY_DISTRIBUTE:
              // run thread on node_num thread_n / (threads per node)
@@ -565,7 +570,25 @@ index 368bc5e5..ab660ebf 100644
              break;
          case GGML_NUMA_STRATEGY_ISOLATE:
              // run thread on current_node
-@@ -29233,6 +29352,36 @@ static void set_numa_thread_affinity(int thread_n) {
+@@ -29221,8 +29345,15 @@ static void set_numa_thread_affinity(int thread_n) {
+ 
+     cpu_set_t * cpus = CPU_ALLOC(g_state.numa.total_cpus);
+     CPU_ZERO_S(setsize, cpus);
+-    for (size_t i = 0; i < node->n_cpus; ++i) {
+-        CPU_SET_S(node->cpus[i], setsize, cpus);
++    if (g_numa_blocked && g_state.numa.numa_strategy == GGML_NUMA_STRATEGY_DISTRIBUTE) {
++        // one hardware thread each, so the scheduler can never stack two spinning threads
++        const int n_nodes = (int)g_state.numa.n_nodes;
++        const int local   = thread_n - (node_num * n_threads + n_nodes - 1) / n_nodes;
++        CPU_SET_S(node->cpus[(local + g_numa_skip) % node->n_cpus], setsize, cpus);
++    } else {
++        for (size_t i = 0; i < node->n_cpus; ++i) {
++            CPU_SET_S(node->cpus[i], setsize, cpus);
++        }
+     }
+ 
+     rv = pthread_setaffinity_np(pthread_self(), setsize, cpus);
+@@ -29233,6 +29364,38 @@ static void set_numa_thread_affinity(int thread_n) {
      CPU_FREE(cpus);
  }
  
@@ -589,6 +612,8 @@ index 368bc5e5..ab660ebf 100644
 +                if (hi <= lo) continue;
 +                unsigned long mask[2] = { 0, 0 };
 +                mask[0] = 1ul << k;
++                // MPOL_MF_MOVE only migrates pages mapped into this process: map them first
++                madvise((void *)lo, hi - lo, 22 /*MADV_POPULATE_READ*/);
 +                // MPOL_BIND = 2, MPOL_MF_MOVE = 2: also migrates pages already present (page cache / tmpfs)
 +                if (syscall(SYS_mbind, (void *)lo, hi - lo, 2, mask, 8*sizeof(mask[0]) + 1, 2) == 0) {
 +                    placed += hi - lo;
@@ -602,7 +627,7 @@ index 368bc5e5..ab660ebf 100644
  static void clear_numa_thread_affinity(void) {
      if (!ggml_is_numa()) {
          return;
-@@ -29286,7 +29435,8 @@ static void set_cpu_thread_affinity(const struct ggml_cplan * cplan, int thread_
+@@ -29286,7 +29449,8 @@ static void set_cpu_thread_affinity(const struct ggml_cplan * cplan, int thread_
  #else
  // TODO: Windows etc.
  // (the linux implementation may also work on BSD, someone should test)
@@ -612,7 +637,7 @@ index 368bc5e5..ab660ebf 100644
  static void clear_numa_thread_affinity(void) {}
  static void set_cpu_thread_affinity(const struct ggml_cplan * cplan, int thread_n) { UNUSED(cplan); UNUSED(thread_n); }
  #endif
-@@ -29794,7 +29944,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -29794,7 +29958,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
      const struct ggml_cgraph * cgraph = state->shared->cgraph;
      const struct ggml_cplan  * cplan  = state->shared->cplan;
  
