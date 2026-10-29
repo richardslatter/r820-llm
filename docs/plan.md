@@ -138,7 +138,7 @@ Greedy 16-token completion of a fixed prompt, 60 threads, `--numa distribute`, m
       3. `is_pascal_hs512` → `ggml_cuda_flash_attn_ext_tile_new`, the Gemma-4 kernel, which **has no attention-sink support** (never reads `src[4]`).
       So every short-context GPU attention drops the per-head `attn_sinks`, decode included; the coherent decode text was luck. Sparse indices are also only turned into a mask when no mask exists.
     - Workaround to test: `-nkvo`, keeping the KV cache and the attention op on the CPU and only the projections on the GPU.
-    - Proper fix (custom kernel): sinks in `tile_new`'s online softmax. Seed each head's running max with its sink logit and the running sum with 1 (exp(sink − max) after rescaling).
+    - Proper fix (custom kernel, `ik_llama/fattn_sinks_patch.py`, written but not yet compiled or tested): sinks in `tile_new`'s online softmax. Seed each head's running max with its sink logit and the running sum with 1 (exp(sink − max) after rescaling).
 
 ## Model facts (measured from the GGUF, 2026-10-29)
 
