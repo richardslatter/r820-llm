@@ -1,0 +1,22 @@
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:wsman="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd" xmlns:p="http://schemas.dell.com/wbem/wscim/1/cim-schema/2/DCIM_BIOSService">
+  <s:Header>
+    <wsa:To s:mustUnderstand="true">https://192.168.1.68:443/wsman</wsa:To>
+    <wsman:ResourceURI s:mustUnderstand="true">http://schemas.dell.com/wbem/wscim/1/cim-schema/2/DCIM_BIOSService</wsman:ResourceURI>
+    <wsa:ReplyTo>
+      <wsa:Address s:mustUnderstand="true">http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</wsa:Address>
+    </wsa:ReplyTo>
+    <wsa:Action s:mustUnderstand="true">http://schemas.dell.com/wbem/wscim/1/cim-schema/2/DCIM_BIOSService/DeletePendingConfiguration</wsa:Action>
+    <wsa:MessageID s:mustUnderstand="true">uuid:6f1c2b4e-8a3d-4c52-9e17-2b8d5a0f9c31</wsa:MessageID>
+    <wsman:SelectorSet>
+      <wsman:Selector Name="SystemCreationClassName">DCIM_ComputerSystem</wsman:Selector>
+      <wsman:Selector Name="CreationClassName">DCIM_BIOSService</wsman:Selector>
+      <wsman:Selector Name="SystemName">DCIM:ComputerSystem</wsman:Selector>
+      <wsman:Selector Name="Name">DCIM:BIOSService</wsman:Selector>
+    </wsman:SelectorSet>
+  </s:Header>
+  <s:Body>
+    <p:DeletePendingConfiguration_INPUT>
+      <p:Target>BIOS.Setup.1-1</p:Target>
+    </p:DeletePendingConfiguration_INPUT>
+  </s:Body>
+</s:Envelope>

@@ -1,0 +1,574 @@
+diff --git a/ggml/CMakeLists.txt b/ggml/CMakeLists.txt
+index bb8c5087..3664bc8b 100644
+--- a/ggml/CMakeLists.txt
++++ b/ggml/CMakeLists.txt
+@@ -113,6 +113,7 @@ set(GGML_MAX_CONTEXTS       "" CACHE STRING "ggml: max model contexts (override
+ # 3rd party libs / backends
+ option(GGML_ACCELERATE                      "ggml: enable Accelerate framework"               ON)
+ option(GGML_IQK_MUL_MAT                     "ggml: use optimized iqk matrix multiplications"  ON)
++option(GGML_IQK_AVX1_SIMDE                   "ggml: build iqk AVX2 kernels on AVX-only CPUs via SIMDe" OFF)
+ 
+ option(GGML_CUDA                            "ggml: use CUDA"                                  OFF)
+ option(GGML_MUSA                            "ggml: use MUSA"                                  OFF)
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 9de1c761..157a0df0 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -947,6 +947,9 @@ extern "C" {
+ 
+     GGML_API void    ggml_numa_init(enum ggml_numa_strategy numa); // call once for better performance on NUMA systems
+     GGML_API bool    ggml_is_numa(void); // true if init detected that system has >1 NUMA node
++    // Move row block k (of n_nodes) of every 2D slice of t onto NUMA node k; returns bytes placed.
++    // Pairs with GGML_NUMA_BLOCKED=1, which makes node k's threads compute exactly those rows.
++    GGML_API size_t  ggml_numa_place_tensor(const struct ggml_tensor * t);
+ 
+     GGML_API void    ggml_print_object (const struct ggml_object * obj);
+     GGML_API void    ggml_print_objects(const struct ggml_context * ctx);
+diff --git a/ggml/src/CMakeLists.txt b/ggml/src/CMakeLists.txt
+index 486c4440..75207eee 100644
+--- a/ggml/src/CMakeLists.txt
++++ b/ggml/src/CMakeLists.txt
+@@ -208,6 +208,12 @@ if (GGML_IQK_MUL_MAT)
+                             iqk/iqk_gemm_iqk_quants.h
+                             iqk/iqk_gemm_1bit.h
+                             iqk/iqk_gemm_legacy_quants.h)
++    if (GGML_IQK_AVX1_SIMDE)
++        message(STATUS "Building iqk AVX2 kernels for AVX-only CPUs via SIMDe")
++        add_compile_definitions(GGML_IQK_AVX1_SIMDE)
++        set_source_files_properties(${GGML_SOURCES_IQK} ${GGML_SOURCES_IQK_MM} PROPERTIES
++            COMPILE_OPTIONS "-Wno-unused-parameter;-include;${CMAKE_CURRENT_SOURCE_DIR}/iqk/iqk_avx1_shim.h")
++    endif()
+     if (GGML_IQK_FLASH_ATTENTION)
+         message(STATUS "Enabling IQK Flash Attention kernels")
+         add_compile_definitions(GGML_IQK_FLASH_ATTENTION)
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 368bc5e5..631d5eb8 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -38,6 +38,10 @@
+ #include <float.h>
+ #include <limits.h>
+ #include <stdarg.h>
++#if defined(__gnu_linux__)
++#include <sys/syscall.h>
++#include <unistd.h>
++#endif
+ #include <signal.h>
+ #if defined(__gnu_linux__)
+ #include <syscall.h>
+@@ -617,6 +621,14 @@ static void ggml_vec_dot_f32(int n, float * restrict s, size_t bs, const float *
+ static void ggml_vec_dot_f16(int n, float * restrict s, size_t bs, ggml_fp16_t * restrict x, size_t bx, ggml_fp16_t * restrict y, size_t by, int nrc);
+ static void ggml_vec_dot_bf16(int n, float * restrict s, size_t bs, ggml_bf16_t * restrict x, size_t bx, ggml_bf16_t * restrict y, size_t by, int nrc);
+ 
++// The iqk kernels pick their activation (vec_dot) formats by __AVX2__. With GGML_IQK_AVX1_SIMDE
++// they are built with their AVX2 paths on an AVX-only CPU, so this table must pick the same formats.
++#if defined(__AVX2__) || defined(GGML_IQK_AVX1_SIMDE)
++#define GGML_IQK_X86_AVX2 1
++#else
++#define GGML_IQK_X86_AVX2 0
++#endif
++
+ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+     [GGML_TYPE_I8] = {
+         .type_name                = "i8",
+@@ -686,7 +698,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+         .from_float               = quantize_row_q2_0,
+         .from_float_ref           = (ggml_from_float_t) quantize_row_q2_0_ref,
+         .vec_dot                  = ggml_vec_dot_q2_0_q8_0,
+-#ifdef __AVX2__
++#if GGML_IQK_X86_AVX2
+         .vec_dot_type             = GGML_TYPE_Q8_2_X4,
+ #else
+         .vec_dot_type             = GGML_TYPE_Q8_0_X4,
+@@ -704,7 +716,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+         .from_float_ref           = (ggml_from_float_t) quantize_row_q4_0_ref,
+         .vec_dot                  = ggml_vec_dot_q4_0_q8_0,
+ #if GGML_USE_IQK_MULMAT
+-#if defined __AVX2__
++#if GGML_IQK_X86_AVX2
+         .vec_dot_type             = GGML_TYPE_Q8_2_X4,
+ #else
+         .vec_dot_type             = GGML_TYPE_Q8_0_X4,
+@@ -729,7 +741,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+         .from_float_ref           = (ggml_from_float_t) quantize_row_q4_1_ref,
+         .vec_dot                  = ggml_vec_dot_q4_1_q8_1,
+ #if GGML_USE_IQK_MULMAT
+-#if defined __AVX2__
++#if GGML_IQK_X86_AVX2
+         .vec_dot_type             = GGML_TYPE_Q8_2_X4,
+ #else
+         .vec_dot_type             = GGML_TYPE_Q8_1_X4,
+@@ -780,7 +792,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+         .from_float_ref           = (ggml_from_float_t) quantize_row_q5_0_ref,
+         .vec_dot                  = ggml_vec_dot_q5_0_q8_0,
+ #if GGML_USE_IQK_MULMAT
+-#if defined __AVX2__
++#if GGML_IQK_X86_AVX2
+         .vec_dot_type             = GGML_TYPE_Q8_2_X4,
+ #else
+         .vec_dot_type             = GGML_TYPE_Q8_0_X4,
+@@ -801,7 +813,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+         .from_float_ref           = (ggml_from_float_t) quantize_row_q5_1_ref,
+         .vec_dot                  = ggml_vec_dot_q5_1_q8_1,
+ #if GGML_USE_IQK_MULMAT
+-#ifdef __AVX2__
++#if GGML_IQK_X86_AVX2
+         .vec_dot_type             = GGML_TYPE_Q8_2_X4,
+ #else
+         .vec_dot_type             = GGML_TYPE_Q8_1_X4,
+@@ -822,7 +834,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+         .from_float_ref           = (ggml_from_float_t) quantize_row_q6_0_ref,
+         .vec_dot                  = ggml_vec_dot_q6_0_q8_0,
+ #if GGML_USE_IQK_MULMAT
+-#if defined __AVX2__
++#if GGML_IQK_X86_AVX2
+         .vec_dot_type             = GGML_TYPE_Q8_2_X4,
+ #else
+         .vec_dot_type             = GGML_TYPE_Q8_0_X4,
+@@ -844,7 +856,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+         .from_float_to_mat        = quantize_mat_q8_0,
+         .vec_dot                  = ggml_vec_dot_q8_0_q8_0,
+ #if GGML_USE_IQK_MULMAT
+-#ifdef __AVX2__
++#if GGML_IQK_X86_AVX2
+         .vec_dot_type             = GGML_TYPE_Q8_2_X4,
+ #else
+         .vec_dot_type             = GGML_TYPE_Q8_0_X4,
+@@ -961,7 +973,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+         .from_float               = quantize_row_q4_K,
+         .from_float_ref           = (ggml_from_float_t) quantize_row_q4_K_ref,
+         .vec_dot                  = ggml_vec_dot_q4_K_q8_K,
+-#ifdef __AVX2__
++#if GGML_IQK_X86_AVX2
+         .vec_dot_type             = GGML_TYPE_Q8_2_X4,
+ #else
+         .vec_dot_type             = GGML_TYPE_Q8_1_X4,
+@@ -991,7 +1003,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+         .from_float               = quantize_row_q5_K,
+         .from_float_ref           = (ggml_from_float_t) quantize_row_q5_K_ref,
+         .vec_dot                  = ggml_vec_dot_q5_K_q8_K,
+-#ifdef __AVX2__
++#if GGML_IQK_X86_AVX2
+         .vec_dot_type             = GGML_TYPE_Q8_2_X4,
+ #else
+         .vec_dot_type             = GGML_TYPE_Q8_1_X4,
+@@ -1021,7 +1033,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+         .from_float               = quantize_row_q6_K,
+         .from_float_ref           = (ggml_from_float_t) quantize_row_q6_K_ref,
+         .vec_dot                  = ggml_vec_dot_q6_K_q8_K,
+-#ifdef __AVX2__
++#if GGML_IQK_X86_AVX2
+         .vec_dot_type             = GGML_TYPE_Q8_2_X4,
+ #else
+         .vec_dot_type             = GGML_TYPE_Q8_0_X4,
+@@ -1308,7 +1320,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+         .from_float               = quantize_row_iq4_nl,
+         .from_float_ref           = (ggml_from_float_t)quantize_row_iq4_nl_ref,
+         .vec_dot                  = ggml_vec_dot_iq4_nl_q8_0,
+-#if __AVX2__
++#if GGML_IQK_X86_AVX2
+         .vec_dot_type             = GGML_TYPE_Q8_2_X4,
+ #else
+         .vec_dot_type             = GGML_TYPE_Q8_0_X4,
+@@ -1338,7 +1350,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+         .from_float               = quantize_row_mxfp4,
+         .from_float_ref           = (ggml_from_float_t)quantize_row_mxfp4_ref,
+         .vec_dot                  = vec_dot_mxfp4_q8_0_x4,
+-#if defined __AVX2__
++#if GGML_IQK_X86_AVX2
+         .vec_dot_type             = GGML_TYPE_Q8_2_X4,
+ #else
+         .vec_dot_type             = GGML_TYPE_Q8_0_X4,
+@@ -1355,7 +1367,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+         .from_float               = quantize_row_mxfp4_r8,
+         .from_float_ref           = (ggml_from_float_t)quantize_row_mxfp4_r8_ref,
+         .vec_dot                  = vec_dot_mxfp4_r8_q8_2_x4,
+-#if defined __AVX2__
++#if GGML_IQK_X86_AVX2
+         .vec_dot_type             = GGML_TYPE_Q8_2_X4,
+ #else
+         .vec_dot_type             = GGML_TYPE_Q8_0_X4,
+@@ -1385,7 +1397,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+         .from_float               = quantize_row_iq4_ks_r4,
+         .from_float_ref           = (ggml_from_float_t)quantize_row_iq4_ks_r4_ref,
+         .vec_dot                  = vec_dot_iq4_ks_r4_q8_k,
+-#if defined __AVX2__
++#if GGML_IQK_X86_AVX2
+         .vec_dot_type             = GGML_TYPE_Q8_K32,
+ #else
+         .vec_dot_type             = GGML_TYPE_Q8_K,
+@@ -1402,7 +1414,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+         .from_float               = quantize_row_iq4_ks_r16,
+         .from_float_ref           = (ggml_from_float_t)quantize_row_iq4_ks_r16_ref,
+         .vec_dot                  = vec_dot_iq4_ks_r16_q8_0,
+-#if defined __AVX2__
++#if GGML_IQK_X86_AVX2
+ #ifdef HAVE_FANCY_SIMD
+         .vec_dot_type             = GGML_TYPE_Q8_K,
+ #else
+@@ -1441,7 +1453,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+         .from_float               = quantize_row_iq5_ks_r4,
+         .from_float_ref           = (ggml_from_float_t)quantize_row_iq5_ks_r4_ref,
+         .vec_dot                  = vec_dot_iq5_ks_r4_q8_k,
+-#if defined __AVX2__
++#if GGML_IQK_X86_AVX2
+         .vec_dot_type             = GGML_TYPE_Q8_K32,
+ #else
+         .vec_dot_type             = GGML_TYPE_Q8_K,
+@@ -1458,7 +1470,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+         .from_float               = quantize_row_iq5_ks_r16,
+         .from_float_ref           = (ggml_from_float_t)quantize_row_iq5_ks_r16_ref,
+         .vec_dot                  = vec_dot_iq5_ks_r16_q8_0,
+-#if defined __AVX2__
++#if GGML_IQK_X86_AVX2
+ #ifdef HAVE_FANCY_SIMD
+         .vec_dot_type             = GGML_TYPE_Q8_K,
+ #else
+@@ -1695,7 +1707,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+         .vec_dot                  = vec_dot_iq1_kt_q8_k,
+ #ifdef HAVE_FANCY_SIMD
+         .vec_dot_type             = GGML_TYPE_Q8_K,
+-#elif defined __AVX2__
++#elif GGML_IQK_X86_AVX2
+         .vec_dot_type             = GGML_TYPE_Q8_2_X4,
+ #else
+         .vec_dot_type             = GGML_TYPE_Q8_0_X4,
+@@ -1714,7 +1726,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+         .vec_dot                  = vec_dot_iq2_kt_q8_k,
+ #ifdef HAVE_FANCY_SIMD
+         .vec_dot_type             = GGML_TYPE_Q8_K,
+-#elif defined __AVX2__
++#elif GGML_IQK_X86_AVX2
+         .vec_dot_type             = GGML_TYPE_Q8_2_X4,
+ #else
+         .vec_dot_type             = GGML_TYPE_Q8_0_X4,
+@@ -1733,7 +1745,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+         .vec_dot                  = vec_dot_iq3_kt_q8_k,
+ #ifdef HAVE_FANCY_SIMD
+         .vec_dot_type             = GGML_TYPE_Q8_K,
+-#elif defined __AVX2__
++#elif GGML_IQK_X86_AVX2
+         .vec_dot_type             = GGML_TYPE_Q8_2_X4,
+ #else
+         .vec_dot_type             = GGML_TYPE_Q8_0_X4,
+@@ -1757,7 +1769,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+         .vec_dot                  = vec_dot_iq4_kt_q8_k,
+ #ifdef HAVE_FANCY_SIMD
+         .vec_dot_type             = GGML_TYPE_Q8_K,
+-#elif defined __AVX2__
++#elif GGML_IQK_X86_AVX2
+         .vec_dot_type             = GGML_TYPE_Q8_2_X4,
+ #else
+         .vec_dot_type             = GGML_TYPE_Q8_0_X4,
+@@ -1774,7 +1786,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+         .from_float               = quantize_row_q1_0_g128,
+         .from_float_ref           = (ggml_from_float_t)quantize_row_q1_0_g128_ref,
+         .vec_dot                  = vec_dot_q1_0_g128_q8_0,
+-#if defined __AVX2__
++#if GGML_IQK_X86_AVX2
+         .vec_dot_type             = GGML_TYPE_Q8_2_X4,
+ #else
+         .vec_dot_type             = GGML_TYPE_Q8_0_X4,
+@@ -1984,7 +1996,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+         .from_float_ref           = (ggml_from_float_t)quantize_row_iq4_nl_r4_ref,
+         .vec_dot                  = vec_dot_iq4_nl_r4_q8_0,
+ #if GGML_USE_IQK_MULMAT
+-#if defined __AVX2__
++#if GGML_IQK_X86_AVX2
+         .vec_dot_type             = GGML_TYPE_Q8_2_X4,
+ #else
+         .vec_dot_type             = GGML_TYPE_Q8_0_X4,
+@@ -2018,7 +2030,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+         .from_float_ref           = (ggml_from_float_t)quantize_row_q4_0_r8_ref,
+         .vec_dot                  = vec_dot_q4_0_r8_q8_0,
+ #if GGML_USE_IQK_MULMAT
+-#if defined __AVX2__
++#if GGML_IQK_X86_AVX2
+         .vec_dot_type             = GGML_TYPE_Q8_2_X4,
+ #else
+         .vec_dot_type             = GGML_TYPE_Q8_0_X4,
+@@ -2039,7 +2051,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+         .from_float_ref           = (ggml_from_float_t)quantize_row_q8_0_r8_ref,
+         .vec_dot                  = vec_dot_q8_0_r8_q8_0,
+ #if GGML_USE_IQK_MULMAT
+-#if defined __AVX2__
++#if GGML_IQK_X86_AVX2
+         .vec_dot_type             = GGML_TYPE_Q8_2_X4,
+ #else
+         .vec_dot_type             = GGML_TYPE_Q8_0_X4,
+@@ -2060,7 +2072,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+         .from_float_ref           = (ggml_from_float_t)quantize_row_q5_0_r4_ref,
+         .vec_dot                  = vec_dot_q5_0_r4_q8_0,
+ #if GGML_USE_IQK_MULMAT
+-#if defined __AVX2__
++#if GGML_IQK_X86_AVX2
+         .vec_dot_type             = GGML_TYPE_Q8_2_X4,
+ #else
+         .vec_dot_type             = GGML_TYPE_Q8_0_X4,
+@@ -2081,7 +2093,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+         .from_float_ref           = (ggml_from_float_t)quantize_row_q6_0_r4_ref,
+         .vec_dot                  = vec_dot_q6_0_r4_q8_0,
+ #if GGML_USE_IQK_MULMAT
+-#if defined __AVX2__
++#if GGML_IQK_X86_AVX2
+         .vec_dot_type             = GGML_TYPE_Q8_2_X4,
+ #else
+         .vec_dot_type             = GGML_TYPE_Q8_0_X4,
+@@ -4027,6 +4039,36 @@ inline static __m128 ggml_v_softcap(__m128 x, float s_before, float s_after) {
+     return _mm_mul_ps(th, _mm_set1_ps(s_after));
+ }
+ 
++
++inline static void ggml_vec_sigmoid_mul_f32(int n, const float * x, const float * y, float * z) {
++    const __m128 zero = _mm_setzero_ps();
++    const __m128 one = _mm_set1_ps(1.0f);
++    int i = 0;
++    for ( ; i + 3 < n; i += 4) {
++        __m128 vx = _mm_loadu_ps(x + i);
++        __m128 vy = _mm_loadu_ps(y + i);
++        __m128 exp_vx = ggml_v_expf(_mm_sub_ps(zero, vx));
++        _mm_storeu_ps(z + i, _mm_div_ps(vy, _mm_add_ps(one, exp_vx)));
++    }
++    for (; i < n; ++i) {
++        z[i] = y[i]/(1.0f + expf(-x[i]));
++    }
++}
++
++inline static void ggml_vec_simd_sigmoid_f32(int n, const float * x, float * y) {
++    const __m128 zero = _mm_setzero_ps();
++    const __m128 one = _mm_set1_ps(1.0f);
++    int i = 0;
++    for ( ; i + 3 < n; i += 4) {
++        __m128 vx = _mm_loadu_ps(x + i);
++        __m128 exp_vx = ggml_v_expf(_mm_sub_ps(zero, vx));
++        _mm_storeu_ps(y + i, _mm_div_ps(one, _mm_add_ps(one, exp_vx)));
++    }
++    for (; i < n; ++i) {
++        y[i] = 1.0f/(1.0f + expf(-x[i]));
++    }
++}
++
+ #endif // __ARM_NEON / __AVX2__ / __SSE2__
+ 
+ static void ggml_vec_silu_f32(const int n, float * y, const float * x) {
+@@ -4997,7 +5039,15 @@ static uint32_t ggml_get_numa_affinity(void) {
+ }
+ #endif
+ 
++// GGML_NUMA_BLOCKED=1: distribute threads to nodes in contiguous blocks instead of round robin
++static bool g_numa_blocked = false;
++
+ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
++    {
++        const char * e = getenv("GGML_NUMA_BLOCKED");
++        g_numa_blocked = e && atoi(e) != 0;
++    }
++
+     if (g_state.numa.n_nodes > 0) {
+         fprintf(stderr, "ggml_numa_init: NUMA already initialized\n");
+ 
+@@ -18819,6 +18869,28 @@ static void ggml_compute_forward_mul_mat_id(
+             if (matrix_row_counts[a] > 0) total_chunks += chunks_per_expert;
+         }
+ 
++        // GGML_NUMA_BLOCKED: node k holds rows quarter k of every expert, so its threads take only
++        // the chunks of that quarter, for every active expert (static, no shared counter)
++        const int n_nodes = (int)g_state.numa.n_nodes;
++        if (g_numa_blocked && n_nodes > 1 && nth % n_nodes == 0 && chunks_per_expert % n_nodes == 0) {
++            const int node = ith * n_nodes / nth;
++            const int tpn  = nth / n_nodes;
++            const int c0   = node * chunks_per_expert / n_nodes;
++            const int c1   = (node + 1) * chunks_per_expert / n_nodes;
++            for (int cur_a = 0; cur_a < n_as; ++cur_a) {
++                if (matrix_row_counts[cur_a] == 0) continue;
++                for (int local_chunk = c0 + ith - node * tpn; local_chunk < c1; local_chunk += tpn) {
++                    const char * src0_cur = (const char *) src0->data + cur_a*nb02;
++                    if (!iqk_mul_mat_moe(ne01, matrix_row_counts[cur_a], ne00, ne11,
++                                src0->type, src0_cur, nb01,
++                                vec_dot_type, (const char *)wdata_mm, row_size_mm,
++                                (float *)dst->data, nb1, nb2,
++                                matrix_rows + cur_a*ne12, local_chunk, chunks_per_expert)) goto IQK_MulMat_Not_Available0;
++                }
++            }
++            return;
++        }
++
+         int chunk_id = ith;
+         while (chunk_id < total_chunks) {
+             // Map global chunk_id to (expert_index, local_chunk_index)
+@@ -19156,6 +19228,42 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
+         if (matrix_row_counts[a] > 0) total_chunks_ug += chunks_per_expert_ug;
+     }
+ 
++    // GGML_NUMA_BLOCKED: node k holds rows quarter k of every expert, so its threads take only
++    // the chunks of that quarter, for every active expert (static, no shared counter)
++    const int n_nodes = (int)g_state.numa.n_nodes;
++    if (g_numa_blocked && n_nodes > 1 && nth % n_nodes == 0 && chunks_per_expert_ug % n_nodes == 0) {
++        const int node = ith * n_nodes / nth;
++        const int tpn  = nth / n_nodes;
++        const int c0   = node * chunks_per_expert_ug / n_nodes;
++        const int c1   = (node + 1) * chunks_per_expert_ug / n_nodes;
++        for (int cur_a = 0; cur_a < n_as; ++cur_a) {
++            if (matrix_row_counts[cur_a] == 0) continue;
++            for (int local_chunk = c0 + ith - node * tpn; local_chunk < c1; local_chunk += tpn) {
++                const char *src0_1_cur, *src0_2_cur, *up_b_cur = NULL, *gate_b_cur = NULL;
++                if (src0_2) {
++                    src0_1_cur = (const char *) src0_1->data + cur_a*nb02;
++                    src0_2_cur = (const char *) src0_2->data + cur_a*nb02;
++                    up_b_cur   = up_b   ? (const char *)up_b->data + cur_a*nb41 : NULL;
++                    gate_b_cur = gate_b ? (const char *)gate_b->data + cur_a*nb51 : NULL;
++                } else {
++                    src0_2_cur = (const char *) src0_1->data + cur_a*nb02;
++                    src0_1_cur = src0_2_cur + nb02/2;
++                    if (up_b) {
++                        GGML_ASSERT(!gate_b);
++                        gate_b_cur = (const char *)up_b->data + cur_a*nb41;
++                        up_b_cur   = gate_b_cur + nb41/2;
++                    }
++                }
++                if (!iqk_moe_fused_up_gate(nr0_base, matrix_row_counts[cur_a], ne00, ne11, dst->op_params[0],
++                            type, src0_1_cur, src0_2_cur, nb01,
++                            vec_dot_type, (const char *)wdata_ug, row_size_ug,
++                            up_b_cur, gate_b_cur,
++                            (float *)dst->data, nb1, nb2,
++                            matrix_rows + cur_a*ne12, limit, situ_beta, situ_beta_linear, local_chunk, chunks_per_expert_ug)) GGML_ABORT("fatal error");
++            }
++        }
++        return;
++    }
+     int last_a = 0;
+     int last_acc = 0;
+     int chunk_id_ug = ith;
+@@ -29188,7 +29296,7 @@ typedef int ggml_lock_t;
+ 
+ // Android's libc implementation "bionic" does not support setting affinity
+ #if defined(__gnu_linux__)
+-static void set_numa_thread_affinity(int thread_n) {
++static void set_numa_thread_affinity(int thread_n, int n_threads) {
+     if (!ggml_is_numa()) {
+         return;
+     }
+@@ -29200,7 +29308,8 @@ static void set_numa_thread_affinity(int thread_n) {
+     switch(g_state.numa.numa_strategy) {
+         case GGML_NUMA_STRATEGY_DISTRIBUTE:
+             // run thread on node_num thread_n / (threads per node)
+-            node_num = thread_n % g_state.numa.n_nodes;
++            node_num = g_numa_blocked ? thread_n * (int)g_state.numa.n_nodes / n_threads
++                                      : thread_n % (int)g_state.numa.n_nodes;
+             break;
+         case GGML_NUMA_STRATEGY_ISOLATE:
+             // run thread on current_node
+@@ -29233,6 +29342,36 @@ static void set_numa_thread_affinity(int thread_n) {
+     CPU_FREE(cpus);
+ }
+ 
++size_t ggml_numa_place_tensor(const struct ggml_tensor * t) {
++    const int n_nodes = (int)g_state.numa.n_nodes;
++    if (n_nodes < 2 || !t || !t->data || t->ne[1] < n_nodes) {
++        return 0;
++    }
++    const size_t page = (size_t)sysconf(_SC_PAGESIZE);
++    const int64_t nrows = t->ne[1];
++    size_t placed = 0;
++    for (int64_t i3 = 0; i3 < t->ne[3]; ++i3) {
++        for (int64_t i2 = 0; i2 < t->ne[2]; ++i2) {
++            const uintptr_t base = (uintptr_t)t->data + i2*t->nb[2] + i3*t->nb[3];
++            for (int k = 0; k < n_nodes; ++k) {
++                // same split as the kernels: rows [k*nrows/n, (k+1)*nrows/n); pages straddling a
++                // boundary go to the lower block
++                uintptr_t lo = (base + (k*nrows/n_nodes)*t->nb[1]) & ~(page - 1);
++                uintptr_t hi = (base + ((k + 1)*nrows/n_nodes)*t->nb[1]) & ~(page - 1);
++                if (k == n_nodes - 1) hi = (base + nrows*t->nb[1] + page - 1) & ~(page - 1);
++                if (hi <= lo) continue;
++                unsigned long mask[2] = { 0, 0 };
++                mask[0] = 1ul << k;
++                // MPOL_BIND = 2, MPOL_MF_MOVE = 2: also migrates pages already present (page cache / tmpfs)
++                if (syscall(SYS_mbind, (void *)lo, hi - lo, 2, mask, 8*sizeof(mask[0]) + 1, 2) == 0) {
++                    placed += hi - lo;
++                }
++            }
++        }
++    }
++    return placed;
++}
++
+ static void clear_numa_thread_affinity(void) {
+     if (!ggml_is_numa()) {
+         return;
+@@ -29286,7 +29425,8 @@ static void set_cpu_thread_affinity(const struct ggml_cplan * cplan, int thread_
+ #else
+ // TODO: Windows etc.
+ // (the linux implementation may also work on BSD, someone should test)
+-static void set_numa_thread_affinity(int thread_n) { UNUSED(thread_n);  }
++static void set_numa_thread_affinity(int thread_n, int n_threads) { UNUSED(thread_n); UNUSED(n_threads); }
++size_t ggml_numa_place_tensor(const struct ggml_tensor * t) { UNUSED(t); return 0; }
+ static void clear_numa_thread_affinity(void) {}
+ static void set_cpu_thread_affinity(const struct ggml_cplan * cplan, int thread_n) { UNUSED(cplan); UNUSED(thread_n); }
+ #endif
+@@ -29794,7 +29934,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+     const struct ggml_cgraph * cgraph = state->shared->cgraph;
+     const struct ggml_cplan  * cplan  = state->shared->cplan;
+ 
+-    set_numa_thread_affinity(state->ith);
++    set_numa_thread_affinity(state->ith, state->shared->n_threads);
+     set_cpu_thread_affinity(cplan, state->ith); // explicit affinity takes precedence over NUMA
+ 
+     struct ggml_compute_params params = {
+diff --git a/src/llama.cpp b/src/llama.cpp
+index e4e15885..15e8960a 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -5418,6 +5418,25 @@ static bool llm_load_tensors(
+         if (defer_ple_mmap) {
+             ml.apply_ple_mmap_policy();
+         }
++
++        // GGML_NUMA_PLACE=1: put row quarter k of every weight matrix on node k (pairs with
++        // GGML_NUMA_BLOCKED=1). Lookup tables (token / Engram embeddings) are left where they are.
++        if (const char * e = getenv("GGML_NUMA_PLACE"); e && atoi(e) && ggml_is_numa()) {
++            const int64_t t0 = ggml_time_us();
++            size_t placed = 0;
++            int n_placed = 0;
++            for (auto & it : model.tensors_by_name) {
++                const ggml_tensor * t = it.second;
++                if (!t->data || !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) continue;
++                if (strstr(t->name, "engram") || strstr(t->name, "token_embd")) continue;
++                if (const size_t b = ggml_numa_place_tensor(t)) {
++                    placed += b;
++                    ++n_placed;
++                }
++            }
++            LLAMA_LOG_INFO("%s: NUMA-placed %d tensors, %.1f GB, in %.1f s\n", __func__, n_placed,
++                           placed/1e9, (ggml_time_us() - t0)/1e6);
++        }
+ #if defined(_WIN32)
+         // Without --defer-ple, fault sparse tables in synchronously (prefetch is best-effort).
+         auto touch_host = [](struct ggml_tensor * t) {
+diff --git a/ggml/src/iqk/iqk_avx1_shim.h b/ggml/src/iqk/iqk_avx1_shim.h
+new file mode 100644
+index 00000000..978ef53b
+--- /dev/null
++++ b/ggml/src/iqk/iqk_avx1_shim.h
+@@ -0,0 +1,22 @@
++//
++// Force-included into the iqk sources when GGML_IQK_AVX1_SIMDE is on.
++// Lets the AVX2/FMA kernels build on AVX-only CPUs (Sandy Bridge): the 256-bit
++// integer and FMA intrinsics are provided by SIMDe on top of AVX/SSE4.
++//
++
++#pragma once
++
++#include <immintrin.h>
++
++#define SIMDE_X86_AVX2_NO_NATIVE
++#define SIMDE_X86_FMA_NO_NATIVE
++#define SIMDE_X86_F16C_NO_NATIVE
++#define SIMDE_ENABLE_NATIVE_ALIASES
++#include <simde/x86/avx2.h>
++#include <simde/x86/fma.h>
++#include <simde/x86/f16c.h>
++
++// Defined only after the system intrinsic headers are in, so they keep their
++// own target pragmas; from here on the iqk code takes its AVX2 paths.
++#define __AVX2__ 1
++#define __FMA__ 1

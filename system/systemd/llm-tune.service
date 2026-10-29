@@ -1,0 +1,9 @@
+[Unit]
+Description=LLM inference host tuning (governor, THP)
+After=multi-user.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c "for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo performance > $g; done; echo always > /sys/kernel/mm/transparent_hugepage/enabled; echo defer+madvise > /sys/kernel/mm/transparent_hugepage/defrag"
+[Install]
+WantedBy=multi-user.target
