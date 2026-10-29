@@ -131,6 +131,8 @@ Greedy 16-token completion of a fixed prompt, 60 threads, `--numa distribute`, m
   - Working command: `LLAMA_OT_CPU_MMAP=1 llama-cli -ngl 12 -ot exps=CPU …`. That puts 12 layers' dense weights on the P2200 (2.1 GB `CUDA0` buffer, ~0.95 GB compute buffer); experts and Engram stay on the CPU, zero copies.
   - First reading, under the cap: 1.18 tok/s decode and 3.5 tok/s prompt, against ~0.7 CPU-only under the same throttle.
   - The GPU output is coherent but differs from the CPU text (different arithmetic for attention), so it needs the perplexity check.
+  - **The perplexity check fails:** chunk 1 is **830.95** on the GPU configuration (`-ngl 12 -ot exps=CPU`, 256-token batches) against 1.4371 on the CPU. Batched evaluation on the offloaded layers is broken, which points at one of the DeepSeek-V4.1 ops on CUDA sm_61; single-token decode looked plausible. GPU numbers are not usable until this is found.
+    - Suspect: DeepSeek-V4.1 attention has 512-wide heads (key/value length 512). Batched CUDA flash attention uses tile/MMA kernels, and Pascal has no tensor cores, so it takes a fallback that may not handle D=512; single-token decode uses the vector kernel. Test: perplexity with `-fa 0`, and with attention kept on the CPU.
 
 ## Model facts (measured from the GGUF, 2026-10-29)
 
