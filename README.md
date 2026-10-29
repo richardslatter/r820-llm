@@ -23,7 +23,13 @@ This is a working log, not a polished project. The plan and all measurements are
 | DeepSeek smoke test, ik vs mainline | next |
 | tok/s: stock vs NUMA-local, 32 vs 64 threads, GPU offload | next |
 
-Current estimate (to be replaced by measurements): the "Q8" file already stores the routed experts as MXFP4, so a token reads roughly 6–8 GB. At ~85 GB/s usable that's ~11–13 tok/s NUMA-local on the CPU, ~15–20 with the GPU and speculative decoding, ~22–25 best case.
+Current estimate (from the tensor list of 7 of 9 shards; to be replaced by measurements):
+- The download (Unsloth UD-Q8_K_XL) stores the routed experts as **MXFP4**, ~4.5 GB per token over 40 MoE layers.
+- It stores attention, shared experts and the output head as **BF16**, ~15.5 GB per token.
+- So a token reads ~20 GB as downloaded: **~4 tok/s** NUMA-local on the CPU.
+- Requantizing only the BF16 part to Q8_0 (near-lossless) gives ~12.7 GB/token and **~6.5 tok/s**.
+- At ~4.5 bits the dense part (~4.4 GB) might fit on the 5 GB GPU, leaving the CPU only the experts: **~12 tok/s**.
+- With speculative decoding on top, **~16–19 tok/s** best case.
 
 ## Layout
 
