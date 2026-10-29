@@ -105,12 +105,26 @@ Greedy 16-token completion of a fixed prompt, 60 threads, `--numa distribute`, m
   - system at ~320 W.
   - `ipmitool delloem powermonitor getpowerbudget` still shows **Power cap 433 W**, below the 545 W "minimum power". The earlier `ipmitool dcmi power deactivate` only cleared the DCMI side; DCMI now says no limit is set.
   - Short runs straight after idle escape the clamp for a few seconds (~530 W, 2.4 GHz, ~2.2–2.7 tok/s), which explains the bimodal results.
-  - In-band changes are refused ("Power cap set feature is not enabled"), so it needs `racadm` with the cord on the iDRAC port: `System.Power.Cap.Enable` → Disabled.
+  - In-band changes are refused ("Power cap set feature is not enabled").
+  - **Fixed via racadm (2026-10-30):** `System.Power.Cap.Enable` was already Disabled, yet `#Cap.ActivePolicy` (name "iDRAC") still enforced 433 W. The value can only be changed while the cap is enabled, so the fix was `racadm set System.Power.Cap.Enable Enabled` then `racadm set System.Power.Cap.Watts 936`. The active policy now reads 936 W (100% = `#Cap.MaxThreshold`), so it never binds. Under-load clocks are still to be verified from the OS.
+  - Also seen in `racadm get System.Power`: `HotSpare.Enable=Enabled` with `HotSpare.PrimaryPSU=PSU1` (the PSU with no AC), and `RedundancyPolicy=Not Redundant`. Left as is.
   - Not the cause: DIMM thermal throttling (~0 throttle cycles in the iMC counters), CPU temperature (≈60 °C), kernel threads, scheduler stacking.
 - **The other misleading result:** a leftover remote `sha256sum` kept running after the local task was stopped, which made all 64-thread runs ~10× slower until it was killed.
 - **Tool notes:**
   - `llama-bench` / `llama-sweep-bench` runs last long enough to always hit the clamp, which is why they read 0.6–0.9 tok/s.
   - All numbers so far are with the cap active; best unclamped readings: ik 2.2 tok/s (interleaved) and 2.71 (pinned + placed, llama-bench straight after the placement run).
+
+## Q8_0 quality and GPU offload (2026-10-30)
+
+- **Q8_0 dense weights are near-lossless.** ik perplexity (same 6 × 256 wikitext chunks): BF16 dense (as downloaded) 3.4907, Q8_0 dense 3.5081 (+0.5%, inside ±0.31).
+- **Capping the CPU clock in-band does not escape the iDRAC cap.** With `scaling_max_freq` at 1.6/1.8/2.0 GHz, the busy clock still sank to 1.0–1.4 GHz and decode stayed at 0.6–0.8 tok/s. DRAM power is ~120–137 W of the budget by itself, and the memory looks throttled too.
+- **GPU offload works with the experts kept on the file mapping:**
+  - In ik's CUDA build `-ot exps=CPU` is silently turned into the pinned `CUDA_Host` type (`llama-load-tensors.cpp`), which copies all 289 GB of experts into anonymous memory → OOM kill at 285 GB.
+  - `-ngl 0` with `=CUDA0` overrides doesn't help: ik ignores GPU overrides when no layers are offloaded.
+  - Fix: new opt-in `LLAMA_OT_CPU_MMAP=1` keeps CPU overrides as the plain CPU type, so they stay mmapped (in `ik_llama/r820.patch`).
+  - Working command: `LLAMA_OT_CPU_MMAP=1 llama-cli -ngl 12 -ot exps=CPU …`. That puts 12 layers' dense weights on the P2200 (2.1 GB `CUDA0` buffer, ~0.95 GB compute buffer); experts and Engram stay on the CPU, zero copies.
+  - First reading, under the cap: 1.18 tok/s decode and 3.5 tok/s prompt, against ~0.7 CPU-only under the same throttle.
+  - The GPU output is coherent but differs from the CPU text (different arithmetic for attention), so it needs the perplexity check.
 
 ## Model facts (measured from the GGUF, 2026-10-29)
 

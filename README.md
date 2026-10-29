@@ -26,7 +26,9 @@ This is a working log, not a polished project. The plan and all measurements are
 | DeepSeek runs on both engines | done: ik 2.31 tok/s, mainline 1.22 (stock placement) |
 | ik vs mainline perplexity check | done: 3.5081 vs 3.5073 |
 | NUMA-local placement (4 KiB pages, per-CPU pinning) | done: 99.7–100% of every row quarter on its node |
-| **iDRAC 433 W power cap still enforced** (cores at 0.4–1.1 GHz under load) | blocking: needs racadm on the iDRAC port |
+| iDRAC 433 W power cap (cores at 0.4–1.1 GHz under load) | fixed: active policy now 936 W; to verify under load |
+| GPU offload (dense on P2200, experts mmapped on CPU) | works with `LLAMA_OT_CPU_MMAP=1`; perplexity check pending |
+| Q8_0 vs BF16 dense quality | done: perplexity 3.5081 vs 3.4907 (+0.5%) |
 | tok/s: stock vs NUMA-local, thread counts, GPU offload | after the cap is off |
 
 First runs (60 threads, stock placement, Q8_0 dense):

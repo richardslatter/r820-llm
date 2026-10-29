@@ -15,14 +15,22 @@ Only one ethernet cord is used. It's moved between the iDRAC dedicated port and 
 
 ## Power cap
 
-The server arrived with a **433 W DCMI power limit** active, probably from a previous owner. Under memory load it throttled the cores to ~1,800 MHz and made bandwidth erratic. Removed in-band:
+The server arrived with a **433 W power cap**, probably set by a previous owner. Under memory load it throttled the cores to ~1,800 MHz and made bandwidth erratic.
+
+`ipmitool dcmi power deactivate` (in-band) only clears the DCMI side. The iDRAC kept enforcing 433 W through its own active policy, even with `System.Power.Cap.Enable=Disabled`:
+- Under sustained load the cores ran at 0.4–1.1 GHz effective (turbostat), at ~30 W per package, with the RAPL "power limit" status set.
+- Short runs right after idle escaped the clamp for a few seconds, so identical runs varied 3–4×.
+
+Find it in-band and fix it on the iDRAC:
 
 ```bash
-sudo ipmitool dcmi power get_limit
-sudo ipmitool dcmi power deactivate
+sudo ipmitool delloem powermonitor getpowerbudget    # "Power cap : 433 Watt" = still enforced
+racadm get System.Power                              # look at #Cap.ActivePolicy.Watts
+racadm set System.Power.Cap.Enable Enabled           # the value can only be changed while enabled
+racadm set System.Power.Cap.Watts 936                # = #Cap.MaxThreshold, so it never binds
 ```
 
-Full-load draw is now ~630 W with cores at ~2,600 MHz.
+To check from the OS, run turbostat under load: Bzy_MHz should stay near 2,600, not 400–1,100.
 
 ## BIOS (2.7.0, the last release)
 
