@@ -19,17 +19,20 @@ This is a working log, not a polished project. The plan and all measurements are
 | ik_llama.cpp on AVX1 (SIMDe shim, type-table fix) | done, kernels verified against a double-precision reference |
 | NUMA-local placement in ik (blocked pinning, static MoE split, mbind) | done, verified on small models |
 | NVIDIA driver + CUDA builds | done |
-| Model (UD-Q8_K_XL, 474 GiB) copied into a RAM disk | in progress |
-| DeepSeek smoke test, ik vs mainline | next |
-| tok/s: stock vs NUMA-local, 32 vs 64 threads, GPU offload | next |
+| Model (UD-Q8_K_XL, 474 GiB) copied into a RAM disk | done |
+| MXFP8 type (the Engram table's format) for both engines | done |
+| ik reads the Unsloth/mainline DeepSeek-V4.1 GGUF layout | done |
+| BF16 dense weights → Q8_0 (rewrite of one 17 GB shard) | done |
+| DeepSeek runs on both engines | done: ik 2.31 tok/s, mainline 1.22 (stock placement) |
+| ik vs mainline perplexity check | next |
+| tok/s: stock vs NUMA-local, thread counts, GPU offload | next |
 
-Current estimate (from the tensor list of 7 of 9 shards; to be replaced by measurements):
-- The download (Unsloth UD-Q8_K_XL) stores the routed experts as **MXFP4**, ~4.5 GB per token over 40 MoE layers.
-- It stores attention, shared experts and the output head as **BF16**, ~15.5 GB per token.
-- So a token reads ~20 GB as downloaded: **~4 tok/s** NUMA-local on the CPU.
-- Requantizing only the BF16 part to Q8_0 (near-lossless) gives ~12.7 GB/token and **~6.5 tok/s**.
-- At ~4.5 bits the dense part (~4.4 GB) might fit on the 5 GB GPU, leaving the CPU only the experts: **~12 tok/s**.
-- With speculative decoding on top, **~16–19 tok/s** best case.
+First runs (60 threads, stock placement, Q8_0 dense):
+- ik_llama.cpp: **2.31 tok/s** decode, 5.3 tok/s prompt.
+- mainline: 1.22 tok/s decode.
+- Each token reads ~12.7 GB, so the NUMA-local work should give the next big step.
+
+Estimate: ~6.5 tok/s NUMA-local on the CPU; ~12 with the dense part on the GPU at ~4.5 bits; ~16–19 best case with speculative decoding. The plan has the per-tensor breakdown.
 
 ## Layout
 
@@ -39,6 +42,10 @@ Current estimate (from the tensor list of 7 of 9 shards; to be replaced by measu
 | `docs/hardware-notes.md` | Boot fix, iDRAC/BIOS recipes, power cap, network |
 | `ik_llama/r820.patch` | All local changes to ik_llama.cpp (AVX1 SIMDe build + NUMA-local engine), including the new shim header |
 | `ik_llama/numa_patch.py` | Script that applies the NUMA part of the patch to a clean checkout |
+| `ik_llama/mxfp8_patch.py` | Adds the MXFP8 type (gather-only) to ik or mainline; the Engram table needs it |
+| `ik_llama/ds41_gguf_patch.py` | Lets ik load DeepSeek-V4.1 GGUFs in the Unsloth/mainline layout |
+| `mainline/mxfp8.patch` | The MXFP8 change as applied to mainline llama.cpp |
+| `tools/requant_shard.c` | Requantizes the BF16 tensors of one GGUF shard, copying the rest |
 | `tools/mmcheck.c` | ggml `mul_mat` / `mul_mat_id` checker against a double-precision reference |
 | `tools/gguf_tensors.py` | Dependency-free GGUF tensor lister (name, type, shape, bytes) |
 | `tools/rd.c` | Read-bandwidth benchmark (256-bit loads, OpenMP) |
@@ -60,12 +67,22 @@ cmake --build build-cpu -j 32
 
 CUDA build: see `scripts/build-cuda.sh` (sm_61, gcc-13 as the nvcc host compiler).
 
-Mainline reference: llama.cpp `f7c01c5226cac1de1052c17920ff38cdefea0ae6` (b11979), stock.
+Mainline reference: llama.cpp `f7c01c5226cac1de1052c17920ff38cdefea0ae6` (b11979) plus `mainline/mxfp8.patch` (`git apply`), same build flags without `GGML_IQK_AVX1_SIMDE`.
 
 ### Runtime switches added by the patch
 
 - `GGML_NUMA_BLOCKED=1` with `--numa distribute`: thread *i* goes to node ⌊*i* × nodes ÷ threads⌋, and MoE expert chunks are split statically by node, so node *k* only ever computes rows quarter *k* of each weight matrix.
 - `GGML_NUMA_PLACE=1`: after loading, row quarter *k* of every weight matrix (each expert slice separately) is moved to node *k* with `mbind(MPOL_BIND, MPOL_MF_MOVE)`. Token and Engram lookup tables are left alone.
+
+## Dense weights to Q8_0
+
+All BF16 tensors are in the last shard, so only that one is rewritten. The others are hard-linked:
+
+```bash
+gcc -O2 -march=native -fopenmp -I$ML/ggml/include tools/requant_shard.c -o requant_shard -L$ML/build-cpu/bin -lggml-base -Wl,-rpath,$ML/build-cpu/bin
+mkdir -p /mnt/models/dq8 && for i in 1 2 3 4 5 6 7 8; do ln /mnt/models/UD-Q8_K_XL/*-0000$i-of-00009.gguf /mnt/models/dq8/; done
+./requant_shard /mnt/models/UD-Q8_K_XL/*-00009-of-00009.gguf /mnt/models/dq8/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00009-of-00009.gguf q8_0 token_embd.weight=keep
+```
 
 ## Tools
 

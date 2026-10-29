@@ -1,0 +1,119 @@
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index d62a63104..78715583f 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -430,7 +430,8 @@ extern "C" {
+         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
+         GGML_TYPE_Q1_0    = 41,
+         GGML_TYPE_Q2_0    = 42,
+-        GGML_TYPE_COUNT   = 43,
++        GGML_TYPE_MXFP8   = 43, // E4M3 + E8M0 scale, gather-only (Unsloth DeepSeek-V4.1 Engram table)
++        GGML_TYPE_COUNT   = 44,
+     };
+ 
+     // [TAG_GGML_PREC]
+diff --git a/ggml/src/ggml-common.h b/ggml/src/ggml-common.h
+index 1dbbe326d..69515cd27 100644
+--- a/ggml/src/ggml-common.h
++++ b/ggml/src/ggml-common.h
+@@ -218,6 +218,14 @@ typedef struct {
+ } block_mxfp4;
+ static_assert(sizeof(block_mxfp4) == sizeof(uint8_t) + QK_MXFP4/2, "wrong mxfp4 block size/padding");
+ 
++// MXFP8 (OCP microscaling): 32 E4M3 values sharing one E8M0 scale. Only read by GET_ROWS.
++#define QK_MXFP8 32
++typedef struct {
++    uint8_t e;            // E8M0 scale
++    uint8_t qs[QK_MXFP8]; // E4M3 codes
++} block_mxfp8;
++static_assert(sizeof(block_mxfp8) == sizeof(uint8_t) + QK_MXFP8, "wrong mxfp8 block size/padding");
++
+ #define QK_NVFP4 64
+ #define QK_NVFP4_SUB 16  // sub-block size for per-group scales
+ typedef struct {
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 85e17018c..4e8d75137 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -5352,6 +5352,7 @@ void ggml_compute_forward_get_rows(
+         case GGML_TYPE_Q5_1:
+         case GGML_TYPE_Q8_0:
+         case GGML_TYPE_Q8_1:
++        case GGML_TYPE_MXFP8:
+         case GGML_TYPE_MXFP4:
+         case GGML_TYPE_NVFP4:
+         case GGML_TYPE_Q2_K:
+diff --git a/ggml/src/ggml-quants.c b/ggml/src/ggml-quants.c
+index 7adec4237..f9347da76 100644
+--- a/ggml/src/ggml-quants.c
++++ b/ggml/src/ggml-quants.c
+@@ -5623,6 +5623,7 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
+         case GGML_TYPE_I8:
+         case GGML_TYPE_I16:
+         case GGML_TYPE_I32:
++        case GGML_TYPE_MXFP8:
+         case GGML_TYPE_I64:
+             // nothing to validate
+             break;
+@@ -5635,3 +5636,31 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
+ 
+     return true;
+ }
++
++// MXFP8: E4M3 (the "fn" variant: no infinities, S.1111.111 is NaN) times a shared E8M0 scale.
++// Every code times every scale is exact in fp32.
++static inline float mxfp8_e4m3_to_fp32(uint8_t x) {
++    const uint32_t e = (x >> 3) & 0xF;
++    const uint32_t m = x & 0x7;
++    float v;
++    if (e == 0) {
++        v = (float) m * (1.0f/512.0f); // subnormal: m/8 * 2^-6
++    } else if (e == 0xF && m == 0x7) {
++        v = NAN;
++    } else {
++        union { uint32_t u; float f; } b = { ((e + 120) << 23) | (m << 20) }; // (1 + m/8) * 2^(e-7)
++        v = b.f;
++    }
++    return x & 0x80 ? -v : v;
++}
++
++void dequantize_row_mxfp8(const block_mxfp8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
++    assert(k % QK_MXFP8 == 0);
++    const int64_t nb = k / QK_MXFP8;
++    for (int64_t i = 0; i < nb; i++) {
++        const float d = x[i].e == 0xFF ? NAN : GGML_E8M0_TO_FP32(x[i].e);
++        for (int j = 0; j < QK_MXFP8; ++j) {
++            y[i*QK_MXFP8 + j] = mxfp8_e4m3_to_fp32(x[i].qs[j]) * d;
++        }
++    }
++}
+diff --git a/ggml/src/ggml-quants.h b/ggml/src/ggml-quants.h
+index 75188f1af..6637c0eed 100644
+--- a/ggml/src/ggml-quants.h
++++ b/ggml/src/ggml-quants.h
+@@ -50,6 +50,7 @@ GGML_API void dequantize_row_q4_1(const block_q4_1 * GGML_RESTRICT x, float * GG
+ GGML_API void dequantize_row_q5_0(const block_q5_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+ GGML_API void dequantize_row_q5_1(const block_q5_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+ GGML_API void dequantize_row_q8_0(const block_q8_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
++GGML_API void dequantize_row_mxfp8(const block_mxfp8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+ //GGML_API void dequantize_row_q8_1(const block_q8_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+ 
+ GGML_API void dequantize_row_mxfp4(const block_mxfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 5d8449a88..889a3eb94 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -757,6 +757,13 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
+         .is_quantized             = true,
+         .from_float_ref           = (ggml_from_float_t) quantize_row_q8_1_ref,
+     },
++    [GGML_TYPE_MXFP8] = {
++        .type_name                = "mxfp8",
++        .blck_size                = QK_MXFP8,
++        .type_size                = sizeof(block_mxfp8),
++        .is_quantized             = true,
++        .to_float                 = (ggml_to_float_t) dequantize_row_mxfp8,
++    },
+     [GGML_TYPE_MXFP4] = {
+         .type_name                = "mxfp4",
+         .blck_size                = QK_MXFP4,

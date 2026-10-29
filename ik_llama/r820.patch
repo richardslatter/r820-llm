@@ -11,10 +11,18 @@ index bb8c5087..3664bc8b 100644
  option(GGML_CUDA                            "ggml: use CUDA"                                  OFF)
  option(GGML_MUSA                            "ggml: use MUSA"                                  OFF)
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 9de1c761..157a0df0 100644
+index 9de1c761..0e9a2949 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
-@@ -947,6 +947,9 @@ extern "C" {
+@@ -427,6 +427,7 @@ extern "C" {
+         GGML_TYPE_MXFP4     = 39,  // so we are compatible with mainline
+         GGML_TYPE_Q1_0_G128 = 41,  // Bonsai 1-bit quants
+         GGML_TYPE_Q2_0      = 42,  // same type id as mainline GGML_TYPE_Q2_0
++        GGML_TYPE_MXFP8     = 43,  // E4M3 + E8M0 scale, gather-only (Unsloth DeepSeek-V4.1 Engram table)
+         //
+         //
+         GGML_TYPE_Q8_0_X4 = 97,
+@@ -947,6 +948,9 @@ extern "C" {
  
      GGML_API void    ggml_numa_init(enum ggml_numa_strategy numa); // call once for better performance on NUMA systems
      GGML_API bool    ggml_is_numa(void); // true if init detected that system has >1 NUMA node
@@ -41,8 +49,83 @@ index 486c4440..75207eee 100644
      if (GGML_IQK_FLASH_ATTENTION)
          message(STATUS "Enabling IQK Flash Attention kernels")
          add_compile_definitions(GGML_IQK_FLASH_ATTENTION)
+diff --git a/ggml/src/ggml-common.h b/ggml/src/ggml-common.h
+index 434aad15..9664fe68 100644
+--- a/ggml/src/ggml-common.h
++++ b/ggml/src/ggml-common.h
+@@ -199,6 +199,14 @@ typedef struct {
+ } block_mxfp4;
+ static_assert(sizeof(block_mxfp4) == sizeof(uint8_t) + QK_MXFP4/2, "wrong mxfp4 block size/padding");
+ 
++// MXFP8 (OCP microscaling): 32 E4M3 values sharing one E8M0 scale. Only read by GET_ROWS.
++#define QK_MXFP8 32
++typedef struct {
++    uint8_t e;            // E8M0 scale
++    uint8_t qs[QK_MXFP8]; // E4M3 codes
++} block_mxfp8;
++static_assert(sizeof(block_mxfp8) == sizeof(uint8_t) + QK_MXFP8, "wrong mxfp8 block size/padding");
++
+ typedef struct {
+     uint8_t e[8]; // E8M0
+     uint8_t qs[4*QK_MXFP4];
+diff --git a/ggml/src/ggml-quants.c b/ggml/src/ggml-quants.c
+index 0c5918a5..bd6ec076 100644
+--- a/ggml/src/ggml-quants.c
++++ b/ggml/src/ggml-quants.c
+@@ -15924,6 +15924,7 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
+                 VALIDATE_ROW_DATA_D_F16_IMPL(block_iq4_nl, data, nb);
+             } break;
+         case GGML_TYPE_MXFP4: break;
++        case GGML_TYPE_MXFP8: break;
+         case GGML_TYPE_MXFP4_R8: break;
+         case GGML_TYPE_Q2_0: break;
+         case GGML_TYPE_Q6_0: break;
+@@ -16560,3 +16561,31 @@ void ggml_gemm_pq2_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void
+         }
+     }
+ }
++
++// MXFP8: E4M3 (the "fn" variant: no infinities, S.1111.111 is NaN) times a shared E8M0 scale.
++// Every code times every scale is exact in fp32.
++static inline float mxfp8_e4m3_to_fp32(uint8_t x) {
++    const uint32_t e = (x >> 3) & 0xF;
++    const uint32_t m = x & 0x7;
++    float v;
++    if (e == 0) {
++        v = (float) m * (1.0f/512.0f); // subnormal: m/8 * 2^-6
++    } else if (e == 0xF && m == 0x7) {
++        v = NAN;
++    } else {
++        union { uint32_t u; float f; } b = { ((e + 120) << 23) | (m << 20) }; // (1 + m/8) * 2^(e-7)
++        v = b.f;
++    }
++    return x & 0x80 ? -v : v;
++}
++
++void dequantize_row_mxfp8(const block_mxfp8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
++    assert(k % QK_MXFP8 == 0);
++    const int64_t nb = k / QK_MXFP8;
++    for (int64_t i = 0; i < nb; i++) {
++        const float d = x[i].e == 0xFF ? NAN : GGML_E8M0_TO_FP32(x[i].e);
++        for (int j = 0; j < QK_MXFP8; ++j) {
++            y[i*QK_MXFP8 + j] = mxfp8_e4m3_to_fp32(x[i].qs[j]) * d;
++        }
++    }
++}
+diff --git a/ggml/src/ggml-quants.h b/ggml/src/ggml-quants.h
+index 1e266581..e2c0b072 100644
+--- a/ggml/src/ggml-quants.h
++++ b/ggml/src/ggml-quants.h
+@@ -80,6 +80,7 @@ void dequantize_row_q4_1(const block_q4_1 * GGML_RESTRICT x, float * GGML_RESTRI
+ void dequantize_row_q5_0(const block_q5_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+ void dequantize_row_q5_1(const block_q5_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+ void dequantize_row_q8_0(const block_q8_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
++void dequantize_row_mxfp8(const block_mxfp8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+ //void dequantize_row_q8_1(const block_q8_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+ void dequantize_row_q6_0(const block_q6_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+ 
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 368bc5e5..631d5eb8 100644
+index 368bc5e5..ab660ebf 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -38,6 +38,10 @@
@@ -170,7 +253,23 @@ index 368bc5e5..631d5eb8 100644
          .vec_dot_type             = GGML_TYPE_Q8_2_X4,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_0_X4,
-@@ -1338,7 +1350,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -1329,6 +1341,15 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+         .nrows                    = 1,
+         .row_meta_size            = 0,
+     },
++    [GGML_TYPE_MXFP8] = {
++        .type_name                = "mxfp8",
++        .blck_size                = QK_MXFP8,
++        .type_size                = sizeof(block_mxfp8),
++        .is_quantized             = true,
++        .to_float                 = (ggml_to_float_t) dequantize_row_mxfp8,
++        .nrows                    = 1,
++        .row_meta_size            = 0,
++    },
+     [GGML_TYPE_MXFP4] = {
+         .type_name                = "mxfp4",
+         .blck_size                = QK_MXFP4,
+@@ -1338,7 +1359,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .from_float               = quantize_row_mxfp4,
          .from_float_ref           = (ggml_from_float_t)quantize_row_mxfp4_ref,
          .vec_dot                  = vec_dot_mxfp4_q8_0_x4,
@@ -179,7 +278,7 @@ index 368bc5e5..631d5eb8 100644
          .vec_dot_type             = GGML_TYPE_Q8_2_X4,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_0_X4,
-@@ -1355,7 +1367,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -1355,7 +1376,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .from_float               = quantize_row_mxfp4_r8,
          .from_float_ref           = (ggml_from_float_t)quantize_row_mxfp4_r8_ref,
          .vec_dot                  = vec_dot_mxfp4_r8_q8_2_x4,
@@ -188,7 +287,7 @@ index 368bc5e5..631d5eb8 100644
          .vec_dot_type             = GGML_TYPE_Q8_2_X4,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_0_X4,
-@@ -1385,7 +1397,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -1385,7 +1406,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .from_float               = quantize_row_iq4_ks_r4,
          .from_float_ref           = (ggml_from_float_t)quantize_row_iq4_ks_r4_ref,
          .vec_dot                  = vec_dot_iq4_ks_r4_q8_k,
@@ -197,7 +296,7 @@ index 368bc5e5..631d5eb8 100644
          .vec_dot_type             = GGML_TYPE_Q8_K32,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_K,
-@@ -1402,7 +1414,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -1402,7 +1423,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .from_float               = quantize_row_iq4_ks_r16,
          .from_float_ref           = (ggml_from_float_t)quantize_row_iq4_ks_r16_ref,
          .vec_dot                  = vec_dot_iq4_ks_r16_q8_0,
@@ -206,7 +305,7 @@ index 368bc5e5..631d5eb8 100644
  #ifdef HAVE_FANCY_SIMD
          .vec_dot_type             = GGML_TYPE_Q8_K,
  #else
-@@ -1441,7 +1453,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -1441,7 +1462,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .from_float               = quantize_row_iq5_ks_r4,
          .from_float_ref           = (ggml_from_float_t)quantize_row_iq5_ks_r4_ref,
          .vec_dot                  = vec_dot_iq5_ks_r4_q8_k,
@@ -215,7 +314,7 @@ index 368bc5e5..631d5eb8 100644
          .vec_dot_type             = GGML_TYPE_Q8_K32,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_K,
-@@ -1458,7 +1470,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -1458,7 +1479,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .from_float               = quantize_row_iq5_ks_r16,
          .from_float_ref           = (ggml_from_float_t)quantize_row_iq5_ks_r16_ref,
          .vec_dot                  = vec_dot_iq5_ks_r16_q8_0,
@@ -224,7 +323,7 @@ index 368bc5e5..631d5eb8 100644
  #ifdef HAVE_FANCY_SIMD
          .vec_dot_type             = GGML_TYPE_Q8_K,
  #else
-@@ -1695,7 +1707,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -1695,7 +1716,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .vec_dot                  = vec_dot_iq1_kt_q8_k,
  #ifdef HAVE_FANCY_SIMD
          .vec_dot_type             = GGML_TYPE_Q8_K,
@@ -233,7 +332,7 @@ index 368bc5e5..631d5eb8 100644
          .vec_dot_type             = GGML_TYPE_Q8_2_X4,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_0_X4,
-@@ -1714,7 +1726,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -1714,7 +1735,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .vec_dot                  = vec_dot_iq2_kt_q8_k,
  #ifdef HAVE_FANCY_SIMD
          .vec_dot_type             = GGML_TYPE_Q8_K,
@@ -242,7 +341,7 @@ index 368bc5e5..631d5eb8 100644
          .vec_dot_type             = GGML_TYPE_Q8_2_X4,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_0_X4,
-@@ -1733,7 +1745,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -1733,7 +1754,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .vec_dot                  = vec_dot_iq3_kt_q8_k,
  #ifdef HAVE_FANCY_SIMD
          .vec_dot_type             = GGML_TYPE_Q8_K,
@@ -251,7 +350,7 @@ index 368bc5e5..631d5eb8 100644
          .vec_dot_type             = GGML_TYPE_Q8_2_X4,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_0_X4,
-@@ -1757,7 +1769,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -1757,7 +1778,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .vec_dot                  = vec_dot_iq4_kt_q8_k,
  #ifdef HAVE_FANCY_SIMD
          .vec_dot_type             = GGML_TYPE_Q8_K,
@@ -260,7 +359,7 @@ index 368bc5e5..631d5eb8 100644
          .vec_dot_type             = GGML_TYPE_Q8_2_X4,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_0_X4,
-@@ -1774,7 +1786,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -1774,7 +1795,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .from_float               = quantize_row_q1_0_g128,
          .from_float_ref           = (ggml_from_float_t)quantize_row_q1_0_g128_ref,
          .vec_dot                  = vec_dot_q1_0_g128_q8_0,
@@ -269,7 +368,7 @@ index 368bc5e5..631d5eb8 100644
          .vec_dot_type             = GGML_TYPE_Q8_2_X4,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_0_X4,
-@@ -1984,7 +1996,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -1984,7 +2005,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .from_float_ref           = (ggml_from_float_t)quantize_row_iq4_nl_r4_ref,
          .vec_dot                  = vec_dot_iq4_nl_r4_q8_0,
  #if GGML_USE_IQK_MULMAT
@@ -278,7 +377,7 @@ index 368bc5e5..631d5eb8 100644
          .vec_dot_type             = GGML_TYPE_Q8_2_X4,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_0_X4,
-@@ -2018,7 +2030,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -2018,7 +2039,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .from_float_ref           = (ggml_from_float_t)quantize_row_q4_0_r8_ref,
          .vec_dot                  = vec_dot_q4_0_r8_q8_0,
  #if GGML_USE_IQK_MULMAT
@@ -287,7 +386,7 @@ index 368bc5e5..631d5eb8 100644
          .vec_dot_type             = GGML_TYPE_Q8_2_X4,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_0_X4,
-@@ -2039,7 +2051,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -2039,7 +2060,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .from_float_ref           = (ggml_from_float_t)quantize_row_q8_0_r8_ref,
          .vec_dot                  = vec_dot_q8_0_r8_q8_0,
  #if GGML_USE_IQK_MULMAT
@@ -296,7 +395,7 @@ index 368bc5e5..631d5eb8 100644
          .vec_dot_type             = GGML_TYPE_Q8_2_X4,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_0_X4,
-@@ -2060,7 +2072,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -2060,7 +2081,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .from_float_ref           = (ggml_from_float_t)quantize_row_q5_0_r4_ref,
          .vec_dot                  = vec_dot_q5_0_r4_q8_0,
  #if GGML_USE_IQK_MULMAT
@@ -305,7 +404,7 @@ index 368bc5e5..631d5eb8 100644
          .vec_dot_type             = GGML_TYPE_Q8_2_X4,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_0_X4,
-@@ -2081,7 +2093,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
+@@ -2081,7 +2102,7 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
          .from_float_ref           = (ggml_from_float_t)quantize_row_q6_0_r4_ref,
          .vec_dot                  = vec_dot_q6_0_r4_q8_0,
  #if GGML_USE_IQK_MULMAT
@@ -314,7 +413,7 @@ index 368bc5e5..631d5eb8 100644
          .vec_dot_type             = GGML_TYPE_Q8_2_X4,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_0_X4,
-@@ -4027,6 +4039,36 @@ inline static __m128 ggml_v_softcap(__m128 x, float s_before, float s_after) {
+@@ -4027,6 +4048,36 @@ inline static __m128 ggml_v_softcap(__m128 x, float s_before, float s_after) {
      return _mm_mul_ps(th, _mm_set1_ps(s_after));
  }
  
@@ -351,7 +450,7 @@ index 368bc5e5..631d5eb8 100644
  #endif // __ARM_NEON / __AVX2__ / __SSE2__
  
  static void ggml_vec_silu_f32(const int n, float * y, const float * x) {
-@@ -4997,7 +5039,15 @@ static uint32_t ggml_get_numa_affinity(void) {
+@@ -4997,7 +5048,15 @@ static uint32_t ggml_get_numa_affinity(void) {
  }
  #endif
  
@@ -367,7 +466,7 @@ index 368bc5e5..631d5eb8 100644
      if (g_state.numa.n_nodes > 0) {
          fprintf(stderr, "ggml_numa_init: NUMA already initialized\n");
  
-@@ -18819,6 +18869,28 @@ static void ggml_compute_forward_mul_mat_id(
+@@ -18819,6 +18878,28 @@ static void ggml_compute_forward_mul_mat_id(
              if (matrix_row_counts[a] > 0) total_chunks += chunks_per_expert;
          }
  
@@ -396,7 +495,7 @@ index 368bc5e5..631d5eb8 100644
          int chunk_id = ith;
          while (chunk_id < total_chunks) {
              // Map global chunk_id to (expert_index, local_chunk_index)
-@@ -19156,6 +19228,42 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
+@@ -19156,6 +19237,42 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
          if (matrix_row_counts[a] > 0) total_chunks_ug += chunks_per_expert_ug;
      }
  
@@ -439,7 +538,15 @@ index 368bc5e5..631d5eb8 100644
      int last_a = 0;
      int last_acc = 0;
      int chunk_id_ug = ith;
-@@ -29188,7 +29296,7 @@ typedef int ggml_lock_t;
+@@ -20477,6 +20594,7 @@ static void ggml_compute_forward_get_rows(
+         case GGML_TYPE_Q6_0_R4:
+         case GGML_TYPE_I2_S:
+         case GGML_TYPE_Q8_0_R8:
++        case GGML_TYPE_MXFP8:
+         case GGML_TYPE_MXFP4:
+         case GGML_TYPE_MXFP4_R8:
+         case GGML_TYPE_IQ4_XS:
+@@ -29188,7 +29306,7 @@ typedef int ggml_lock_t;
  
  // Android's libc implementation "bionic" does not support setting affinity
  #if defined(__gnu_linux__)
@@ -448,7 +555,7 @@ index 368bc5e5..631d5eb8 100644
      if (!ggml_is_numa()) {
          return;
      }
-@@ -29200,7 +29308,8 @@ static void set_numa_thread_affinity(int thread_n) {
+@@ -29200,7 +29318,8 @@ static void set_numa_thread_affinity(int thread_n) {
      switch(g_state.numa.numa_strategy) {
          case GGML_NUMA_STRATEGY_DISTRIBUTE:
              // run thread on node_num thread_n / (threads per node)
@@ -458,7 +565,7 @@ index 368bc5e5..631d5eb8 100644
              break;
          case GGML_NUMA_STRATEGY_ISOLATE:
              // run thread on current_node
-@@ -29233,6 +29342,36 @@ static void set_numa_thread_affinity(int thread_n) {
+@@ -29233,6 +29352,36 @@ static void set_numa_thread_affinity(int thread_n) {
      CPU_FREE(cpus);
  }
  
@@ -495,7 +602,7 @@ index 368bc5e5..631d5eb8 100644
  static void clear_numa_thread_affinity(void) {
      if (!ggml_is_numa()) {
          return;
-@@ -29286,7 +29425,8 @@ static void set_cpu_thread_affinity(const struct ggml_cplan * cplan, int thread_
+@@ -29286,7 +29435,8 @@ static void set_cpu_thread_affinity(const struct ggml_cplan * cplan, int thread_
  #else
  // TODO: Windows etc.
  // (the linux implementation may also work on BSD, someone should test)
@@ -505,7 +612,7 @@ index 368bc5e5..631d5eb8 100644
  static void clear_numa_thread_affinity(void) {}
  static void set_cpu_thread_affinity(const struct ggml_cplan * cplan, int thread_n) { UNUSED(cplan); UNUSED(thread_n); }
  #endif
-@@ -29794,7 +29934,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -29794,7 +29944,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
      const struct ggml_cgraph * cgraph = state->shared->cgraph;
      const struct ggml_cplan  * cplan  = state->shared->cplan;
  
@@ -514,6 +621,127 @@ index 368bc5e5..631d5eb8 100644
      set_cpu_thread_affinity(cplan, state->ith); // explicit affinity takes precedence over NUMA
  
      struct ggml_compute_params params = {
+diff --git a/src/graphs/build_deepseek4.cpp b/src/graphs/build_deepseek4.cpp
+index 7f973c3a..eb2cb9c6 100644
+--- a/src/graphs/build_deepseek4.cpp
++++ b/src/graphs/build_deepseek4.cpp
+@@ -1148,11 +1148,11 @@ static ggml_tensor * ds4_build_engram(ggml_context * ctx0, llm_build_context & l
+         t = ggml_reshape_3d(ctx0, t, n_embd, hc, nt);
+         t = ggml_rms_norm(ctx0, t, hparams.f_norm_rms_eps);
+         t = ggml_reshape_2d(ctx0, t, hc_dim, nt);
+-        t = ggml_mul(ctx0, t, w);
++        if (w) t = ggml_mul(ctx0, t, w);
+         return ggml_reshape_3d(ctx0, t, n_embd, hc, nt);
+     };
+     ggml_tensor * k = grouped_norm(key, as_f32(layer.engram_k, "engram_k"));
+-    ggml_tensor * q = grouped_norm(ggml_cont(ctx0, x), as_f32(layer.engram_q, "engram_q"));
++    ggml_tensor * q = grouped_norm(ggml_cont(ctx0, x), layer.engram_q ? as_f32(layer.engram_q, "engram_q") : nullptr);
+ 
+     ggml_tensor * s = ggml_sum_rows(ctx0, ggml_mul(ctx0, k, q));                 // [1, hc, nt]
+     s = ggml_scale(ctx0, s, 1.0f/sqrtf((float) n_embd));
+diff --git a/src/llama-hparams.cpp b/src/llama-hparams.cpp
+index 6edf1fe7..0c652b65 100644
+--- a/src/llama-hparams.cpp
++++ b/src/llama-hparams.cpp
+@@ -2363,19 +2363,30 @@ void llm_load_hparams(
+                     ml.get_key(LLM_KV_HASH_LAYER_COUNT, hparams.dsv4_hash_layer_count, false);
+ 
+                     if (model.arch == LLM_ARCH_DEEPSEEK41) {
+-                        ml.get_arr_n(LLM_KV_ENGRAM_LAYER_IDS, hparams.engram_n_layer);
++                        // mainline / Unsloth GGUFs name the same hash parameters ple.* (see ds41_gguf_patch.py)
++                        const bool ple_names = !ml.get_arr_n(LLM_KV_ENGRAM_LAYER_IDS, hparams.engram_n_layer, false);
++                        const std::string ids_key = ple_names ? std::string("deepseek41.ple.layers") : ml.llm_kv(LLM_KV_ENGRAM_LAYER_IDS);
++                        if (ple_names) {
++                            ml.get_arr_n(ids_key, hparams.engram_n_layer);
++                        }
+                         if (hparams.engram_n_layer == 0 || hparams.engram_n_layer > LLAMA_MAX_LAYERS) {
+                             throw std::runtime_error(format("DeepSeek-V4.1 engram layer count %u is out of range", hparams.engram_n_layer));
+                         }
+                         {
+                             std::vector<uint32_t> ids;
+-                            ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_LAYER_IDS), ids);
++                            ml.get_arr(ids_key, ids);
+                             std::copy_n(ids.begin(), std::min<size_t>(ids.size(), LLAMA_MAX_LAYERS), hparams.engram_layer_ids.begin());
+                         }
+-                        ml.get_key(LLM_KV_ENGRAM_HEAD_COUNT,     hparams.engram_n_head);
+-                        ml.get_key(LLM_KV_ENGRAM_KEY_LENGTH,     hparams.engram_key_length);
+-                        ml.get_key(LLM_KV_ENGRAM_MAX_NGRAM_SIZE, hparams.engram_max_ngram_size);
+-                        ml.get_key(LLM_KV_ENGRAM_PAD_ID,         model.engram_pad_id);
++                        if (ple_names) {
++                            ml.get_key("deepseek41.ple.heads_per_ngram",              hparams.engram_n_head);
++                            ml.get_key("deepseek41.embedding_length_per_layer_input", hparams.engram_key_length);
++                            ml.get_key("deepseek41.ple.ngram_size",                   hparams.engram_max_ngram_size);
++                        } else {
++                            ml.get_key(LLM_KV_ENGRAM_HEAD_COUNT,     hparams.engram_n_head);
++                            ml.get_key(LLM_KV_ENGRAM_KEY_LENGTH,     hparams.engram_key_length);
++                            ml.get_key(LLM_KV_ENGRAM_MAX_NGRAM_SIZE, hparams.engram_max_ngram_size);
++                            ml.get_key(LLM_KV_ENGRAM_PAD_ID,         model.engram_pad_id);
++                        }
+                         if (hparams.engram_n_head == 0 || hparams.engram_max_ngram_size < 2) {
+                             throw std::runtime_error("DeepSeek-V4.1 engram needs at least one head and a 2-gram");
+                         }
+@@ -2384,10 +2395,25 @@ void llm_load_hparams(
+                                 throw std::runtime_error(format("engram layer %u is out of range", hparams.engram_layer_ids[e]));
+                             }
+                         }
+-                        ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_MULTIPLIERS), model.engram_multipliers);
+-                        ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_PRIMES),      model.engram_primes);
+-                        ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_OFFSETS),     model.engram_offsets);
++                        if (ple_names) {
++                            ml.get_arr("deepseek41.ple.layer_multipliers", model.engram_multipliers);
++                            ml.get_arr("deepseek41.ple.head_vocab_sizes",  model.engram_primes);
++                            ml.get_arr("deepseek41.ple.head_offsets",      model.engram_offsets);
++                        } else {
++                            ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_MULTIPLIERS), model.engram_multipliers);
++                            ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_PRIMES),      model.engram_primes);
++                            ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_OFFSETS),     model.engram_offsets);
++                        }
+                         ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_TOKEN_MAP),   model.engram_token_map);
++                        if (ple_names) {
++                            // ple pads with a token id; the hash works on compressed ids
++                            uint32_t pad_token = 0;
++                            ml.get_key("deepseek41.engram.pad_token_id", pad_token);
++                            if (pad_token >= model.engram_token_map.size()) {
++                                throw std::runtime_error("DeepSeek-V4.1 engram pad token is outside the token map");
++                            }
++                            model.engram_pad_id = model.engram_token_map[pad_token];
++                        }
+                         const size_t n_bucket = (size_t) (hparams.engram_max_ngram_size - 1) * hparams.engram_n_head;
+                         if (model.engram_multipliers.size() != (size_t) hparams.engram_n_layer * hparams.engram_max_ngram_size) {
+                             throw std::runtime_error("engram multiplier count does not match layers * ngram size");
+diff --git a/src/llama-load-tensors.cpp b/src/llama-load-tensors.cpp
+index 1e264042..11e261d9 100644
+--- a/src/llama-load-tensors.cpp
++++ b/src/llama-load-tensors.cpp
+@@ -3784,6 +3784,15 @@ bool create_tensors_helper::create_deepseek4_tensors(const LLM_TN & tn) {
+             layer.engram_wkv = create_tensor_from_meta(ctx_split, format("blk.%d.engram_wkv.weight", i));
+             layer.engram_k   = create_tensor_from_meta(ctx_split, format("blk.%d.engram_k.weight", i));
+             layer.engram_q   = create_tensor_from_meta(ctx_split, format("blk.%d.engram_q.weight", i));
++        } else if (model.arch == LLM_ARCH_DEEPSEEK41 && hparams.engram_index(i) >= 0 &&
++                   ml.get_tensor_meta("per_layer_token_embd.weight") != nullptr) {
++            // mainline / Unsloth layout: one table shared by all Engram layers (its offsets are
++            // global), and the key and query norm weights folded into one gate
++            ggml_tensor * table = ggml_get_tensor(ctx_input, "per_layer_token_embd.weight");
++            layer.engram_embd = table ? table : create_tensor_from_meta(ctx_input, "per_layer_token_embd.weight");
++            layer.engram_wkv  = create_tensor_from_meta(ctx_split, format("blk.%d.engram_kv.weight", i));
++            layer.engram_k    = create_tensor_from_meta(ctx_split, format("blk.%d.engram_gate.weight", i));
++            layer.engram_q    = nullptr;
+         }
+ 
+     }
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index aba93035..d5db7522 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -714,7 +714,7 @@ void llama_model_loader::build_ple_tensor_index() {
+     int n_engram = 0;
+     for (int i = 0; i < n_tensors; ++i) {
+         const std::string name = get_tensor_name(i);
+-        if (name.find("engram_embd.weight") == std::string::npos) {
++        if (name.find("engram_embd.weight") == std::string::npos && name != "per_layer_token_embd.weight") {
+             continue;
+         }
+         const auto * ew = get_weight(name.c_str());
 diff --git a/src/llama.cpp b/src/llama.cpp
 index e4e15885..15e8960a 100644
 --- a/src/llama.cpp

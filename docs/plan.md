@@ -1,6 +1,6 @@
 # DeepSeek V4.1 Flash on the R820: inference plan
 
-Goal: run DeepSeek V4.1 Flash locally and push single-stream tokens/sec as high as this hardware allows, **without buying anything**. Phase 1 tunes Q8, Phase 2 moves to Q4.
+Goal: run DeepSeek V4.1 Flash locally and push single-stream tokens/sec as high as this hardware allows, **without buying anything**. Phase 1 tunes the download as is; Phase 2 requantizes its BF16 dense weights.
 
 ## Hardware (as measured)
 
@@ -12,7 +12,7 @@ Goal: run DeepSeek V4.1 Flash locally and push single-stream tokens/sec as high 
 | GPU | NVIDIA Quadro P2200 (Pascal GP106), 5 GB GDDR5X, ~200 GB/s |
 | Disk | 131 GB on RAID-1 (PERC H710), too small for the model |
 | Network | 4 × 1 GbE (BCM5720), 2 × 10 GbE SFP+ (Intel 82599) |
-| OS | Ubuntu 26.04.1 LTS, kernel 7.0, host `r820` (`r820.local`, DHCP, currently 192.168.1.136) |
+| OS | Ubuntu 26.04.1 LTS, kernel 7.0, host `r820` at 192.168.1.137 |
 
 Free RAM option: pull 16 sticks to run 2 per channel (512 GB). If the BIOS then runs them at 1600, that's **204.8 GB/s (+20%)**. Too small for Q8, fine for Q4.
 
@@ -70,18 +70,46 @@ Read-only bandwidth, AVX 256-bit loads, 48 sticks at 1333:
 - **Verified:** static expert split results are identical to the stock path (MXFP4, Q8_0, Q4_K at 1–33 tokens, 64 threads); Qwen3 perplexity is unchanged (21.6671).
 - **Caveat:** a merged up+gate expert tensor would need each half placed separately. DeepSeek's GGUF keeps them separate.
 
-## Model facts
+## First DeepSeek runs (2026-10-29)
 
-- 552B parameters in the main model, plus 196.6B in the **Engram** lookup tables (read one row per token, negligible bandwidth).
-- 384 routed experts per layer, 6 active per token. Separate **DSpark** drafter for speculative decoding (~8 GB at Q8).
-- Q8 download is ~508 GB (474 GiB, 9 shards, SHA256 verified) at `nas.local:/volume1/@home/richard/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-Q8_K_XL`.
-- **The "Q8_K_XL" file stores the routed experts as MXFP4** (ggml type 39, 4.25 bits per weight). Each expert tensor is 5120 × 2304 × 384 experts, 2.41 GB per tensor and ~18.8 MB per expert's three matrices. Only the non-expert weights are Q8.
-  - So **requantizing the experts to Q4_K would not shrink them** (4.5 bpw against 4.25). The download is effectively already the "Q4 experts" model, and Phase 2 needs rethinking: see below.
-- **Estimated bytes per token:** 6 experts × 18.8 MB ≈ 113 MB per MoE layer, plus attention and shared weights at Q8.
-  - The 203 GB shard is likely the Engram tables, of which only one row per table is read per token. If so, the experts span roughly 42 layers, giving **~5–8 GB per token**, not the ~17 GB first assumed.
-  - To confirm from the full tensor list (`~/bench/gguf_tensors.py`) once all shards are copied.
+Greedy 16-token completion of a fixed prompt, 60 threads, `--numa distribute`, model pages interleaved over the 4 nodes (stock placement, no NUMA patch active):
 
-Decode speed ≈ usable bandwidth ÷ bytes per token. Q8 is ~1.06 bytes/weight (~17 GB/token), Q4 experts ~0.56 (~9.5 GB/token). **The quantisation level is a bigger lever than any RAM or CPU change.**
+| Engine | Dense weights | Decode tok/s | Prompt tok/s (7 tokens) |
+|---|---|---|---|
+| mainline llama.cpp | BF16 (as downloaded) | 0.43 | 4.2 |
+| mainline llama.cpp | Q8_0 (`requant_shard`) | 1.22 | 2.1 |
+| **ik_llama.cpp** | Q8_0 | **2.31** | 5.3 |
+
+- **Never run 64 threads with anything else busy.** With 64 threads on the 64 logical CPUs, one background job (the SHA256 check) made every run ~10× slower: 0.10–0.12 tok/s. perf showed 95% of the time spinning in OpenMP barriers. The engine syncs threads hundreds of times per token, so one descheduled thread stalls all of them. Use ≤60 threads, or keep the machine idle.
+- BF16 dense weights cost mainline 2.8× (scalar BF16 code on AVX1), more than their 1.6× extra bytes. Q8_0 dense is the working format from here on.
+- ik is 1.9× faster than mainline on the same file before any of our NUMA work.
+- **Outputs differ from the first generated token** (ik ": Ganymede, Europa, Callisto…", mainline " Io, Europa, and Ganymede…"). Both are coherent, but it needs a perplexity comparison before trusting ik's numbers.
+- Getting ik to load the file took two patches:
+  - `mxfp8_patch.py`: MXFP8 type, also applied to mainline.
+  - `ds41_gguf_patch.py`: ik expects a different Engram GGUF layout. Same rolling-xor hash and maths, different key names; one shared table instead of per-layer tables; key and query gate weights folded into one tensor. The shim maps the Unsloth/mainline layout onto ik's.
+
+## Model facts (measured from the GGUF, 2026-10-29)
+
+Unsloth UD-Q8_K_XL: 474 GiB in 9 shards (SHA256 verified on the NAS), at `nas.local:/volume1/@home/richard/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-Q8_K_XL`. 40 layers, all MoE: 384 routed experts (6 active) plus 1 shared expert per layer. 4 hyper-connection streams (`embedding_length_out` 20480).
+
+| Part | Format | Total | Read per token | Shards |
+|---|---|---|---|---|
+| Routed experts (gate/up/down, 5120×2304×384 each) | **MXFP4** (type 39, 4.25 bpw) | 288.8 GB | **4.51 GB** (6/384 of each layer) | 00002–00007 |
+| Attention (q_a, q_b, kv, output_a/b, indexer, compressor) | **BF16** | 10.3 GB | 10.3 GB | 00009 |
+| Shared experts | **BF16** | 2.8 GB | 2.8 GB | 00009 |
+| Output head | BF16 | 1.3 GB | 1.3 GB | 00009 |
+| Engram projections (`engram_kv`, 2 layers) | BF16 | 0.6 GB | 0.6 GB | 00009 |
+| Router, hyper-connection weights, norms | F32 | 0.5 GB | 0.5 GB | 00009 |
+| Engram table (`per_layer_token_embd`, 256 × 768M rows) | **MXFP8** (type 43, 8.25 bpw) | 202.8 GB | ~0 (row lookups) | 00008 |
+| Token embedding | BF16 | 1.3 GB | ~0 (row lookup) | 00009 |
+
+- **~20 GB read per token as downloaded**, of which 15.5 GB is BF16 dense weights. The earlier "~5–8 GB" estimate assumed those were Q8; they're BF16.
+- **All the BF16 weights are in the last shard (00009, 16.8 GB).** Requantizing them only means rewriting that one file: Q8_0 makes it ~8.2 GB per token (~12.7 GB per token in all), Q4_K-class ~4.4 GB (~8.9 in all). The expert and Engram shards stay as they are.
+- **The experts are already 4-bit.** Requantizing them to Q4_K would not shrink them.
+- **MXFP8** (OCP microscaling: 32 E4M3 values with one E8M0 scale) is not in mainline llama.cpp or ik. It comes from the unmerged llama.cpp PR #30817, which Unsloth's guide builds from. Ported as a gather-only type with `ik_llama/mxfp8_patch.py` (to_float + GET_ROWS), and applied to both trees. The decoder is verified exact for all 256 codes; sampled Engram rows decode cleanly (RMS 0.88, max 5, no NaN).
+- **DSpark:** the metadata describes it (block size 5, 128 experts, 3 active), but the drafter weights are not in this download.
+
+Decode speed ≈ usable bandwidth ÷ bytes per token. **The BF16 dense weights are now the biggest lever**: 15.5 of the 20 GB per token.
 
 ## Compatibility issues
 
@@ -96,6 +124,7 @@ Decode speed ≈ usable bandwidth ÷ bytes per token. Q8 is ~1.06 bytes/weight (
 | ik_llama.cpp AVX-only bugs | NaN logits reported on the non-IQK path; IQ*_KT quantisation silently broken without AVX2 | Apply the fork fix; quantise IQ formats on the Mac (ARM NEON path) |
 | ik_llama.cpp V4.1 support | In PRs #2455 / #2506 / #2545; merge state unverified | Check main, merge PRs if needed |
 | CPU build | Default builds target AVX2 | Build on the server with `-march=native` |
+| Unsloth GGUF | Engram table is **MXFP8 (type 43)**, from unmerged llama.cpp PR #30817; mainline and ik reject the file | **Resolved:** own gather-only MXFP8 port (`mxfp8_patch.py`) for both trees |
 | Everything else | PERC H710, both NICs and NUMA tools all fine on kernel 7.0 | Nothing needed |
 
 ## Base engine
@@ -118,14 +147,15 @@ Decode speed ≈ usable bandwidth ÷ bytes per token. Q8 is ~1.06 bytes/weight (
 2. Calculate exact bytes per token from the GGUF.
 3. Tune NUMA placement, thread count (32 vs 64), pinning per socket, and ik options (`-fmoe -mla 3 -rtr`).
 4. GPU: dense layers and KV cache on the P2200 (`-ngl 99 -ot "exps=CPU"`), then GPU prompt processing for long prompts.
-5. **Expected: ~3.5–5 tok/s baseline, ~5–7 tuned.**
+5. **Expected as downloaded (~20 GB/token): ~1.5 tok/s stock interleaved, ~4 NUMA-local.**
 
-### Phase 2: Q4
-1. Requantise the experts to **Q4_K_M** (works on both builds today), keep dense layers at Q8: `llama-quantize --allow-requantize`. Write the result to the NAS, since Q8 and Q4 won't both fit in RAM.
+### Phase 2: requantize the BF16 dense weights (was "Q4")
+1. Rewrite only shard 00009: BF16 → **Q8_0** first (near-lossless), then try Q6_K / Q5_K / Q4_K for attention and shared experts. Experts (MXFP4) and the Engram table (MXFP8) stay as they are. Only ~17 GB needs rewriting, so it fits in RAM next to the model.
 2. Repeat the Phase 1 tuning.
-3. **RAM test:** remove 16 sticks (1 per channel) and check the configured speed. Keep that layout if it runs at 1600.
-4. Quality check against Q8: perplexity plus your own prompts.
-5. **Expected: ~7–10 tok/s, +20% if the RAM runs at 1600.**
+3. GPU: with the dense part at ~4.5 bits (~4.4 GB) it may fit on the 5 GB P2200, leaving only the experts for the CPU.
+4. Quality check against the BF16 original: perplexity plus your own prompts.
+5. RAM test (2 DIMMs per channel at 1600) is off the table: 512 GB is too small for the 474 GiB model.
+6. **Expected: ~6.5 tok/s with Q8_0 dense on the CPU; ~12 with ~4.5-bit dense on the GPU and experts NUMA-local on the CPU.**
 
 ### Phase 3: rewrite ik's fast routines for AVX
 1. Port `iqk_mul_mat` to AVX: 128-bit integer maths (SSSE3/AVX: `pmaddubsw`, `pmaddwd`), 256-bit float, no FMA. Start with Q8_0 and Q4_K, then IQ4_K/IQ4_KS.
@@ -144,16 +174,16 @@ Decode speed ≈ usable bandwidth ÷ bytes per token. Q8 is ~1.06 bytes/weight (
 4. Layer-by-layer comparison against the reference implementation.
 5. **Expected at Q4: ~13.5 tok/s at 1333, ~17 at 1600, 20–25 with GPU and speculative decoding.**
 
-## Targets (no purchases)
+## Targets (no purchases), revised for the measured model
 
-| | Q8 | Q4 experts |
-|---|---|---|
-| Stock llama.cpp | 3.5–5 | 6–9 |
-| Tuned, with GPU | 5–7 | 8–12 |
-| + speculative decoding | 6.5–10 | 10–16 |
-| Custom engine, everything combined | **10–12** | **20–25** |
+| | As downloaded (BF16 dense, ~20 GB/token) | Dense → Q8_0 (~12.7 GB/token) | Dense ~4.5-bit on the GPU, experts on the CPU |
+|---|---|---|---|
+| Stock llama.cpp (interleaved) | ~1.5 | ~2.5 | – |
+| NUMA-local engine, CPU only | ~4 | ~6.5 | – |
+| + GPU | – | – | ~12 |
+| + speculative decoding (DSpark, ×1.3–1.5) | – | ~8–10 | **~16–19** |
 
-All figures depend on the measured bytes per token from Phase 1.
+To be replaced by measurements.
 
 ## Sources
 
