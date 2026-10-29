@@ -171,7 +171,7 @@ index 1e266581..e2c0b072 100644
  void dequantize_row_q6_0(const block_q6_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
  
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 368bc5e5..3b628b1f 100644
+index 368bc5e5..f68f581a 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -38,6 +38,11 @@
@@ -460,7 +460,21 @@ index 368bc5e5..3b628b1f 100644
          .vec_dot_type             = GGML_TYPE_Q8_2_X4,
  #else
          .vec_dot_type             = GGML_TYPE_Q8_0_X4,
-@@ -4027,6 +4049,36 @@ inline static __m128 ggml_v_softcap(__m128 x, float s_before, float s_after) {
+@@ -3080,6 +3102,13 @@ struct ggml_compute_state_shared {
+     atomic_int current_chunk; // currently processing chunk during mul_mat, shared between all the threads
+ 
+     enum ggml_status ec;
++
++    // two-level barrier for GGML_NUMA_BLOCKED (ggml_hbarrier); hb_n_nodes == 0 means off
++    int hb_n_nodes;
++    int hb_node_n[8];
++    struct { _Alignas(64) atomic_int v; } hb_count[8];
++    struct { _Alignas(64) atomic_int v; } hb_release[8];
++    _Alignas(64) atomic_int hb_global;
+ };
+ 
+ struct ggml_compute_state {
+@@ -4027,6 +4056,36 @@ inline static __m128 ggml_v_softcap(__m128 x, float s_before, float s_after) {
      return _mm_mul_ps(th, _mm_set1_ps(s_after));
  }
  
@@ -497,7 +511,56 @@ index 368bc5e5..3b628b1f 100644
  #endif // __ARM_NEON / __AVX2__ / __SSE2__
  
  static void ggml_vec_silu_f32(const int n, float * y, const float * x) {
-@@ -4997,7 +5049,19 @@ static uint32_t ggml_get_numa_affinity(void) {
+@@ -4959,11 +5018,37 @@ static inline void ggml_barrier_impl(struct ggml_compute_state_shared * shared)
+     }
+ }
+ 
++static _Thread_local int g_hb_node = 0;
++
++static void ggml_hbarrier(struct ggml_compute_state_shared * shared) {
++    const int node = g_hb_node;
++    const int epoch = atomic_load_explicit(&shared->hb_release[node].v, memory_order_relaxed);
++    if (atomic_fetch_add_explicit(&shared->hb_count[node].v, 1, memory_order_acq_rel) == shared->hb_node_n[node] - 1) {
++        atomic_store_explicit(&shared->hb_count[node].v, 0, memory_order_relaxed);
++        if (atomic_fetch_add_explicit(&shared->hb_global, 1, memory_order_acq_rel) == shared->hb_n_nodes - 1) {
++            atomic_store_explicit(&shared->hb_global, 0, memory_order_relaxed);
++            for (int k = 0; k < shared->hb_n_nodes; ++k) {
++                atomic_store_explicit(&shared->hb_release[k].v, epoch + 1, memory_order_release);
++            }
++            return;
++        }
++    }
++    while (atomic_load_explicit(&shared->hb_release[node].v, memory_order_acquire) == epoch) {
++#if defined(__SSE3__)
++        _mm_pause();
++#endif
++    }
++}
++
+ #ifdef GGML_USE_OPENMP
+ static void ggml_barrier(struct ggml_compute_state_shared * shared) {
+     if (shared->n_threads == 1) {
+         return;
+     }
++    if (shared->hb_n_nodes > 1) {
++        ggml_hbarrier(shared);
++        return;
++    }
+     if (shared && shared->n_batch > 32) {
+         ggml_barrier_impl(shared);
+         return;
+@@ -4972,6 +5057,10 @@ static void ggml_barrier(struct ggml_compute_state_shared * shared) {
+ }
+ #else
+ static void ggml_barrier(struct ggml_compute_state_shared * shared) {
++    if (shared->n_threads > 1 && shared->hb_n_nodes > 1) {
++        ggml_hbarrier(shared);
++        return;
++    }
+     ggml_barrier_impl(shared);
+ }
+ #endif
+@@ -4997,7 +5086,19 @@ static uint32_t ggml_get_numa_affinity(void) {
  }
  #endif
  
@@ -517,7 +580,7 @@ index 368bc5e5..3b628b1f 100644
      if (g_state.numa.n_nodes > 0) {
          fprintf(stderr, "ggml_numa_init: NUMA already initialized\n");
  
-@@ -18819,6 +18883,28 @@ static void ggml_compute_forward_mul_mat_id(
+@@ -18819,6 +18920,28 @@ static void ggml_compute_forward_mul_mat_id(
              if (matrix_row_counts[a] > 0) total_chunks += chunks_per_expert;
          }
  
@@ -546,7 +609,7 @@ index 368bc5e5..3b628b1f 100644
          int chunk_id = ith;
          while (chunk_id < total_chunks) {
              // Map global chunk_id to (expert_index, local_chunk_index)
-@@ -19156,6 +19242,42 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
+@@ -19156,6 +19279,42 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
          if (matrix_row_counts[a] > 0) total_chunks_ug += chunks_per_expert_ug;
      }
  
@@ -589,7 +652,7 @@ index 368bc5e5..3b628b1f 100644
      int last_a = 0;
      int last_acc = 0;
      int chunk_id_ug = ith;
-@@ -20477,6 +20599,7 @@ static void ggml_compute_forward_get_rows(
+@@ -20477,6 +20636,7 @@ static void ggml_compute_forward_get_rows(
          case GGML_TYPE_Q6_0_R4:
          case GGML_TYPE_I2_S:
          case GGML_TYPE_Q8_0_R8:
@@ -597,7 +660,7 @@ index 368bc5e5..3b628b1f 100644
          case GGML_TYPE_MXFP4:
          case GGML_TYPE_MXFP4_R8:
          case GGML_TYPE_IQ4_XS:
-@@ -29188,7 +29311,7 @@ typedef int ggml_lock_t;
+@@ -29188,7 +29348,7 @@ typedef int ggml_lock_t;
  
  // Android's libc implementation "bionic" does not support setting affinity
  #if defined(__gnu_linux__)
@@ -606,7 +669,7 @@ index 368bc5e5..3b628b1f 100644
      if (!ggml_is_numa()) {
          return;
      }
-@@ -29200,7 +29323,8 @@ static void set_numa_thread_affinity(int thread_n) {
+@@ -29200,7 +29360,8 @@ static void set_numa_thread_affinity(int thread_n) {
      switch(g_state.numa.numa_strategy) {
          case GGML_NUMA_STRATEGY_DISTRIBUTE:
              // run thread on node_num thread_n / (threads per node)
@@ -616,7 +679,7 @@ index 368bc5e5..3b628b1f 100644
              break;
          case GGML_NUMA_STRATEGY_ISOLATE:
              // run thread on current_node
-@@ -29221,8 +29345,15 @@ static void set_numa_thread_affinity(int thread_n) {
+@@ -29221,8 +29382,15 @@ static void set_numa_thread_affinity(int thread_n) {
  
      cpu_set_t * cpus = CPU_ALLOC(g_state.numa.total_cpus);
      CPU_ZERO_S(setsize, cpus);
@@ -634,7 +697,7 @@ index 368bc5e5..3b628b1f 100644
      }
  
      rv = pthread_setaffinity_np(pthread_self(), setsize, cpus);
-@@ -29233,6 +29364,38 @@ static void set_numa_thread_affinity(int thread_n) {
+@@ -29233,6 +29401,38 @@ static void set_numa_thread_affinity(int thread_n) {
      CPU_FREE(cpus);
  }
  
@@ -673,7 +736,7 @@ index 368bc5e5..3b628b1f 100644
  static void clear_numa_thread_affinity(void) {
      if (!ggml_is_numa()) {
          return;
-@@ -29286,7 +29449,8 @@ static void set_cpu_thread_affinity(const struct ggml_cplan * cplan, int thread_
+@@ -29286,7 +29486,8 @@ static void set_cpu_thread_affinity(const struct ggml_cplan * cplan, int thread_
  #else
  // TODO: Windows etc.
  // (the linux implementation may also work on BSD, someone should test)
@@ -683,15 +746,509 @@ index 368bc5e5..3b628b1f 100644
  static void clear_numa_thread_affinity(void) {}
  static void set_cpu_thread_affinity(const struct ggml_cplan * cplan, int thread_n) { UNUSED(cplan); UNUSED(thread_n); }
  #endif
-@@ -29794,7 +29958,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -29788,14 +29989,96 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
+     return cplan;
+ }
+ 
++static void ggml_hbarrier_setup(struct ggml_compute_state_shared * shared) {
++    shared->hb_n_nodes = 0;
++#if defined(__gnu_linux__)
++    const char * e = getenv("GGML_HBARRIER");
++    if (e && atoi(e) == 0) return;
++    const int n_nodes = (int)g_state.numa.n_nodes, n = shared->n_threads;
++    if (!g_numa_blocked || g_state.numa.numa_strategy != GGML_NUMA_STRATEGY_DISTRIBUTE ||
++        n_nodes < 2 || n_nodes > 8 || n < 2*n_nodes) return;
++    for (int k = 0; k < n_nodes; ++k) shared->hb_node_n[k] = 0;
++    for (int i = 0; i < n; ++i) shared->hb_node_n[i*n_nodes/n]++;   // same split as set_numa_thread_affinity
++    for (int k = 0; k < n_nodes; ++k) {
++        atomic_store(&shared->hb_count[k].v, 0);
++        atomic_store(&shared->hb_release[k].v, 0);
++    }
++    atomic_store(&shared->hb_global, 0);
++    shared->hb_n_nodes = n_nodes;
++#endif
++}
++
++// GGML_OP_PROF=1: per-op wall / slowest-thread time, printed at exit
++#include <x86intrin.h>
++#define GGML_PROF_KEYS (GGML_OP_COUNT*64)
++static int      g_prof_on = -1;
++static int64_t  g_prof_wall[GGML_PROF_KEYS], g_prof_max[GGML_PROF_KEYS], g_prof_sum[GGML_PROF_KEYS], g_prof_cnt[GGML_PROF_KEYS];
++static int64_t  g_prof_thr[512];
++static int64_t  g_prof_graphs = 0, g_prof_tsc0 = 0, g_prof_us0 = 0;
++// matmuls again, per weight name with the "blk.N." prefix dropped
++static char     g_prof_names[256][48];
++static int64_t  g_prof_nwall[256], g_prof_nmax[256], g_prof_nsum[256], g_prof_ncnt[256], g_prof_nbytes[256];
++static int      g_prof_nn = 0;
++
++static int ggml_prof_name_idx(const char * name) {
++    if (strncmp(name, "blk.", 4) == 0) {
++        const char * d = strchr(name + 4, '.');
++        if (d) name = d + 1;
++    }
++    for (int i = 0; i < g_prof_nn; ++i) if (strcmp(g_prof_names[i], name) == 0) return i;
++    if (g_prof_nn == 256) return -1;
++    snprintf(g_prof_names[g_prof_nn], sizeof(g_prof_names[0]), "%s", name);
++    return g_prof_nn++;
++}
++
++static void ggml_prof_print(void) {
++    const double tsc_per_us = (double)(__rdtsc() - g_prof_tsc0)/(double)(ggml_time_us() - g_prof_us0);
++    int64_t tot = 0;
++    for (int k = 0; k < GGML_PROF_KEYS; ++k) tot += g_prof_wall[k];
++    fprintf(stderr, "\nop profile: %lld graphs, %.2f ms/graph total wall\n", (long long)g_prof_graphs, tot/tsc_per_us/1e3/g_prof_graphs);
++    fprintf(stderr, "%-28s %8s %10s %10s %10s %10s\n", "op", "n/graph", "wall ms", "slowest", "average", "barrier");
++    for (;;) {
++        int best = -1;
++        for (int k = 0; k < GGML_PROF_KEYS; ++k) if (g_prof_cnt[k] && (best < 0 || g_prof_wall[k] > g_prof_wall[best])) best = k;
++        if (best < 0) break;
++        const int op = best/64, t = best%64;
++        char name[64];
++        if (op == GGML_OP_MUL_MAT || op == GGML_OP_MUL_MAT_ID || op == GGML_OP_MOE_FUSED_UP_GATE) {
++            snprintf(name, sizeof(name), "%s.%s", ggml_op_name((enum ggml_op)op), ggml_type_name((enum ggml_type)t));
++        } else {
++            snprintf(name, sizeof(name), "%s", ggml_op_name((enum ggml_op)op));
++        }
++        const double g = (double)g_prof_graphs*tsc_per_us*1e3;
++        fprintf(stderr, "%-28s %8.1f %10.2f %10.2f %10.2f %10.2f\n", name, (double)g_prof_cnt[best]/g_prof_graphs,
++                g_prof_wall[best]/g, g_prof_max[best]/g, g_prof_sum[best]/g, (g_prof_wall[best] - g_prof_max[best])/g);
++        g_prof_cnt[best] = 0;
++    }
++    fprintf(stderr, "\n%-28s %8s %10s %10s %10s %10s\n", "matmul weight", "n/graph", "wall ms", "slowest", "average", "GB/s");
++    for (;;) {
++        int best = -1;
++        for (int k = 0; k < g_prof_nn; ++k) if (g_prof_ncnt[k] && (best < 0 || g_prof_nwall[k] > g_prof_nwall[best])) best = k;
++        if (best < 0) break;
++        const double g = (double)g_prof_graphs*tsc_per_us*1e3;
++        fprintf(stderr, "%-28s %8.1f %10.2f %10.2f %10.2f %10.1f\n", g_prof_names[best], (double)g_prof_ncnt[best]/g_prof_graphs,
++                g_prof_nwall[best]/g, g_prof_nmax[best]/g, g_prof_nsum[best]/g,
++                g_prof_nbytes[best]/(g_prof_nwall[best]/tsc_per_us*1e3));
++        g_prof_ncnt[best] = 0;
++    }
++}
++
+ static thread_ret_t ggml_graph_compute_thread(void * data) {
+     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
+ 
      const struct ggml_cgraph * cgraph = state->shared->cgraph;
      const struct ggml_cplan  * cplan  = state->shared->cplan;
  
 -    set_numa_thread_affinity(state->ith);
 +    set_numa_thread_affinity(state->ith, state->shared->n_threads);
      set_cpu_thread_affinity(cplan, state->ith); // explicit affinity takes precedence over NUMA
++    if (state->shared->hb_n_nodes > 1) {
++        g_hb_node = state->ith*state->shared->hb_n_nodes/state->shared->n_threads;
++    }
++    const bool prof = g_prof_on > 0 && state->shared->n_threads <= 512;
++    if (prof && state->ith == 0) g_prof_graphs++;
  
      struct ggml_compute_params params = {
+         /*.ith   =*/ state->ith,
+@@ -29818,7 +30101,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+ #if IK_PRINT_TIMING
+         int64_t tim1 = ggml_time_us();
+ #endif
++        const int64_t pt0 = prof ? (int64_t)__rdtsc() : 0;
+         node_n = ggml_compute_forward(&params, node, cgraph, node_n);
++        if (prof) g_prof_thr[state->ith] = (int64_t)__rdtsc() - pt0;
+ #if IK_PRINT_TIMING
+         int64_t tim2 = ggml_time_us();
+         t_eval += tim2 - tim1;
+@@ -29830,6 +30115,30 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+ 
+         ggml_barrier(state->shared);
+ 
++        if (prof && state->ith == 0) {
++            const int64_t wall = (int64_t)__rdtsc() - pt0;
++            int64_t mx = 0, sm = 0;
++            for (int j = 0; j < state->shared->n_threads; ++j) { mx = MAX(mx, g_prof_thr[j]); sm += g_prof_thr[j]; }
++            int key = node->op*64;
++            if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_MOE_FUSED_UP_GATE) && node->src[0]) {
++                key += node->src[0]->type % 64;
++            }
++            g_prof_wall[key] += wall; g_prof_max[key] += mx; g_prof_sum[key] += sm/state->shared->n_threads; g_prof_cnt[key]++;
++            if (key%64 || node->op == GGML_OP_MUL_MAT) {
++                const int ni = node->src[0] ? ggml_prof_name_idx(node->src[0]->name) : -1;
++                if (ni >= 0) {
++                    // bytes actually read: all of a dense weight, the selected experts' share of an expert tensor
++                    int64_t bytes = ggml_nbytes(node->src[0]);
++                    if (node->op != GGML_OP_MUL_MAT && node->src[0]->ne[2] > 1) {
++                        const struct ggml_tensor * ids = node->op == GGML_OP_MUL_MAT_ID ? node->src[2] : node->src[3];
++                        if (ids) bytes = bytes/node->src[0]->ne[2]*ggml_nelements(ids)*(node->op == GGML_OP_MOE_FUSED_UP_GATE ? 2 : 1);
++                    }
++                    g_prof_nwall[ni] += wall; g_prof_nmax[ni] += mx; g_prof_nsum[ni] += sm/state->shared->n_threads;
++                    g_prof_ncnt[ni]++; g_prof_nbytes[ni] += bytes;
++                }
++            }
++        }
++
+         if (state->shared->ec != GGML_STATUS_SUCCESS) {
+             break;
+         }
+@@ -29849,6 +30158,16 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+ 
+     int n_threads = cplan->n_threads;
+ 
++    if (g_prof_on < 0) {
++        const char * e = getenv("GGML_OP_PROF");
++        g_prof_on = e && atoi(e) != 0;
++        if (g_prof_on) {
++            g_prof_tsc0 = (int64_t)__rdtsc();
++            g_prof_us0  = ggml_time_us();
++            atexit(ggml_prof_print);
++        }
++    }
++
+ #if defined(__gnu_linux__)
+     // the calling thread is worker 0 and gets pinned below; remember its affinity
+     cpu_set_t saved_affinity;
+@@ -29882,6 +30201,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+                 // update the number of threads from the actual number of threads that we got from OpenMP
+                 n_threads = omp_get_num_threads();
+                 state_shared.n_threads = n_threads;
++                ggml_hbarrier_setup(&state_shared);
+             }
+ 
+             struct ggml_compute_state worker = {
+@@ -29905,6 +30225,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+     }
+ #else
+     struct ggml_compute_state * workers = alloca(sizeof(struct ggml_compute_state)*n_threads);
++    ggml_hbarrier_setup(&state_shared);
+ 
+     for (int j = 0; j < n_threads; ++j) {
+         workers[j] = (struct ggml_compute_state) {
+diff --git a/ggml/src/iqk/iqk_avx1_gemv.h b/ggml/src/iqk/iqk_avx1_gemv.h
+new file mode 100644
+index 00000000..3e68d079
+--- /dev/null
++++ b/ggml/src/iqk/iqk_avx1_gemv.h
+@@ -0,0 +1,195 @@
++//
++// Native 128-bit matrix x small-batch kernels for Sandy Bridge (AVX1, no AVX2/FMA/F16C).
++//
++// Weights: Q8_0 (fp16 scale + 32 int8) and MXFP4 (e8m0 scale + 32 fp4 nibbles).
++// Activations: Q8_2_X4 rows as produced by ik's quantize_row_q8_2_x4 (groups of four
++// blocks with 4 bf16 scales, 4 int16 block sums, 128 int8 quants; a remainder of
++// n/32 % 4 blocks is stored as plain block_q8_2).
++//
++// The SIMDe-emulated AVX2 kernels split each 256-bit integer op into two 128-bit
++// halves and move data between ymm halves, and they convert fp16 scales with a
++// scalar fallback, so on this CPU they ran at about half of the memory bandwidth.
++// These keep everything in xmm registers, reduce four block sums with one transpose
++// and convert scales with plain integer ops.
++//
++#pragma once
++
++#include <immintrin.h>
++#include <stdint.h>
++#include <string.h>
++
++namespace avx1_gemv {
++
++struct blk_q8_2_x4 { uint16_t d[8]; int8_t qs[128]; };
++struct blk_q8_2    { uint16_t d; uint16_t s; int8_t qs[32]; };
++struct blk_q8_0    { uint16_t d; int8_t qs[32]; };
++struct blk_mxfp4   { uint8_t e; uint8_t qs[16]; };
++static_assert(sizeof(blk_q8_2_x4) == 144, "q8_2_x4");
++static_assert(sizeof(blk_q8_2) == 36, "q8_2");
++static_assert(sizeof(blk_q8_0) == 34, "q8_0");
++static_assert(sizeof(blk_mxfp4) == 17, "mxfp4");
++
++// [sum(p0), sum(p1), sum(p2), sum(p3)]
++static inline __m128i sum4_epi32(__m128i p0, __m128i p1, __m128i p2, __m128i p3) {
++    const __m128i p01 = _mm_add_epi32(_mm_unpacklo_epi32(p0, p1), _mm_unpackhi_epi32(p0, p1));
++    const __m128i p23 = _mm_add_epi32(_mm_unpacklo_epi32(p2, p3), _mm_unpackhi_epi32(p2, p3));
++    return _mm_add_epi32(_mm_unpacklo_epi64(p01, p23), _mm_unpackhi_epi64(p01, p23));
++}
++
++static inline float hsum_ps(__m128 v) {
++    v = _mm_add_ps(v, _mm_movehl_ps(v, v));
++    v = _mm_add_ss(v, _mm_movehdup_ps(v));
++    return _mm_cvtss_f32(v);
++}
++
++// four fp16 values in the low halves of the 32-bit lanes -> fp32, denormals included
++static inline __m128 fp16x4_to_f32(__m128i h) {
++    const __m128i sign = _mm_slli_epi32(_mm_and_si128(h, _mm_set1_epi32(0x8000)), 16);
++    h = _mm_and_si128(h, _mm_set1_epi32(0x7fff));
++    const __m128 fn = _mm_castsi128_ps(_mm_add_epi32(_mm_slli_epi32(h, 13), _mm_set1_epi32(112 << 23)));
++    const __m128 fd = _mm_mul_ps(_mm_cvtepi32_ps(h), _mm_set1_ps(5.9604644775390625e-08f)); // 2^-24
++    const __m128 f  = _mm_blendv_ps(fn, fd, _mm_castsi128_ps(_mm_cmplt_epi32(h, _mm_set1_epi32(0x0400))));
++    return _mm_or_ps(f, _mm_castsi128_ps(sign));
++}
++
++static inline float fp16_to_f32(uint16_t h) {
++    return _mm_cvtss_f32(fp16x4_to_f32(_mm_cvtsi32_si128(h)));
++}
++
++// four bf16 scales -> fp32
++static inline __m128 bf16x4_to_f32(const uint16_t * d) {
++    return _mm_castsi128_ps(_mm_slli_epi32(_mm_cvtepu16_epi32(_mm_loadl_epi64((const __m128i *)d)), 16));
++}
++
++static inline float bf16_to_f32(uint16_t d) {
++    uint32_t u = (uint32_t)d << 16; float f; memcpy(&f, &u, 4); return f;
++}
++
++// signed x signed int8 dot of 32 values, as 4 int32 partial sums
++static inline __m128i dot32_ss(__m128i x0, __m128i x1, const int8_t * y) {
++    const __m128i ones = _mm_set1_epi16(1);
++    const __m128i y0 = _mm_loadu_si128((const __m128i *)y);
++    const __m128i y1 = _mm_loadu_si128((const __m128i *)(y + 16));
++    const __m128i s0 = _mm_maddubs_epi16(_mm_abs_epi8(x0), _mm_sign_epi8(y0, x0));
++    const __m128i s1 = _mm_maddubs_epi16(_mm_abs_epi8(x1), _mm_sign_epi8(y1, x1));
++    return _mm_add_epi32(_mm_madd_epi16(s0, ones), _mm_madd_epi16(s1, ones));
++}
++
++// unsigned (<= 24) x signed int8 dot of 32 values, as 4 int32 partial sums
++static inline __m128i dot32_us(__m128i u0, __m128i u1, const int8_t * y) {
++    const __m128i ones = _mm_set1_epi16(1);
++    const __m128i y0 = _mm_loadu_si128((const __m128i *)y);
++    const __m128i y1 = _mm_loadu_si128((const __m128i *)(y + 16));
++    return _mm_madd_epi16(_mm_add_epi16(_mm_maddubs_epi16(u0, y0), _mm_maddubs_epi16(u1, y1)), ones);
++}
++
++template <int ny>
++struct Rows {
++    const char * y[ny];
++};
++
++//
++// Q8_0 weights. Each output: sum_b dx_b * dy_b * sum_i x_bi * y_bi
++//
++template <int ny, typename Store>
++static void gemv_q8_0(int n, const void * vx, size_t bx, const Rows<ny> & rows, int nrc_x, Store && store) {
++    const int nb = n / 32;
++    const int ng = nb / 4;
++    for (int ix = 0; ix < nrc_x; ++ix) {
++        const blk_q8_0 * x = (const blk_q8_0 *)((const char *)vx + ix*bx);
++        __m128 acc[ny];
++        for (int iy = 0; iy < ny; ++iy) acc[iy] = _mm_setzero_ps();
++        for (int g = 0; g < ng; ++g) {
++            const blk_q8_0 * xb = x + 4*g;
++            __m128i h = _mm_cvtsi32_si128(xb[0].d);
++            h = _mm_insert_epi16(h, xb[1].d, 2);
++            h = _mm_insert_epi16(h, xb[2].d, 4);
++            h = _mm_insert_epi16(h, xb[3].d, 6);
++            const __m128 dx = fp16x4_to_f32(h);
++            __m128i p[ny][4];
++            for (int k = 0; k < 4; ++k) {
++                const __m128i x0 = _mm_loadu_si128((const __m128i *)xb[k].qs);
++                const __m128i x1 = _mm_loadu_si128((const __m128i *)(xb[k].qs + 16));
++                for (int iy = 0; iy < ny; ++iy) {
++                    const blk_q8_2_x4 * yb = (const blk_q8_2_x4 *)rows.y[iy] + g;
++                    p[iy][k] = dot32_ss(x0, x1, yb->qs + 32*k);
++                }
++            }
++            for (int iy = 0; iy < ny; ++iy) {
++                const blk_q8_2_x4 * yb = (const blk_q8_2_x4 *)rows.y[iy] + g;
++                const __m128 d = _mm_mul_ps(dx, bf16x4_to_f32(yb->d));
++                const __m128i s = sum4_epi32(p[iy][0], p[iy][1], p[iy][2], p[iy][3]);
++                acc[iy] = _mm_add_ps(acc[iy], _mm_mul_ps(d, _mm_cvtepi32_ps(s)));
++            }
++        }
++        float tail[ny] = {};
++        for (int i = 4*ng; i < nb; ++i) {
++            const __m128i x0 = _mm_loadu_si128((const __m128i *)x[i].qs);
++            const __m128i x1 = _mm_loadu_si128((const __m128i *)(x[i].qs + 16));
++            const float dx = fp16_to_f32(x[i].d);
++            for (int iy = 0; iy < ny; ++iy) {
++                const blk_q8_2 * yb = (const blk_q8_2 *)rows.y[iy] + i;
++                const __m128i s = dot32_ss(x0, x1, yb->qs);
++                tail[iy] += dx*bf16_to_f32(yb->d)*(float)_mm_cvtsi128_si32(sum4_epi32(s, s, s, s));
++            }
++        }
++        for (int iy = 0; iy < ny; ++iy) store(ix, iy, hsum_ps(acc[iy]) + tail[iy]);
++    }
++}
++
++//
++// MXFP4 weights. Nibbles index kvalues_mxfp4 (twice the E2M1 values), shifted by +12 to make
++// them unsigned for pmaddubsw; the shift is undone with the int16 block sums of the activations.
++// Scale 2^(e-127) is built directly from the exponent byte; the extra 1/2 is applied at the end.
++//
++template <int ny, typename Store>
++static void gemv_mxfp4(int n, const void * vx, size_t bx, const Rows<ny> & rows, int nrc_x, Store && store) {
++    const int nb = n / 32;
++    const int ng = nb / 4;
++    const __m128i values = _mm_setr_epi8(12, 13, 14, 15, 16, 18, 20, 24, 12, 11, 10, 9, 8, 6, 4, 0);
++    const __m128i m4 = _mm_set1_epi8(0x0f);
++    const __m128i twelve = _mm_set1_epi32(12);
++    for (int ix = 0; ix < nrc_x; ++ix) {
++        const blk_mxfp4 * x = (const blk_mxfp4 *)((const char *)vx + ix*bx);
++        __m128 acc[ny];
++        for (int iy = 0; iy < ny; ++iy) acc[iy] = _mm_setzero_ps();
++        for (int g = 0; g < ng; ++g) {
++            const blk_mxfp4 * xb = x + 4*g;
++            const uint32_t e4 = (uint32_t)xb[0].e | ((uint32_t)xb[1].e << 8) | ((uint32_t)xb[2].e << 16) | ((uint32_t)xb[3].e << 24);
++            const __m128 dx = _mm_castsi128_ps(_mm_slli_epi32(_mm_cvtepu8_epi32(_mm_cvtsi32_si128(e4)), 23));
++            __m128i p[ny][4];
++            for (int k = 0; k < 4; ++k) {
++                const __m128i q  = _mm_loadu_si128((const __m128i *)xb[k].qs);
++                const __m128i u0 = _mm_shuffle_epi8(values, _mm_and_si128(q, m4));
++                const __m128i u1 = _mm_shuffle_epi8(values, _mm_and_si128(_mm_srli_epi16(q, 4), m4));
++                for (int iy = 0; iy < ny; ++iy) {
++                    const blk_q8_2_x4 * yb = (const blk_q8_2_x4 *)rows.y[iy] + g;
++                    p[iy][k] = dot32_us(u0, u1, yb->qs + 32*k);
++                }
++            }
++            for (int iy = 0; iy < ny; ++iy) {
++                const blk_q8_2_x4 * yb = (const blk_q8_2_x4 *)rows.y[iy] + g;
++                const __m128i ys = _mm_cvtepi16_epi32(_mm_loadl_epi64((const __m128i *)(yb->d + 4)));
++                const __m128i s  = _mm_sub_epi32(sum4_epi32(p[iy][0], p[iy][1], p[iy][2], p[iy][3]), _mm_mullo_epi32(ys, twelve));
++                const __m128  d  = _mm_mul_ps(dx, bf16x4_to_f32(yb->d));
++                acc[iy] = _mm_add_ps(acc[iy], _mm_mul_ps(d, _mm_cvtepi32_ps(s)));
++            }
++        }
++        float tail[ny] = {};
++        for (int i = 4*ng; i < nb; ++i) {
++            const __m128i q  = _mm_loadu_si128((const __m128i *)x[i].qs);
++            const __m128i u0 = _mm_shuffle_epi8(values, _mm_and_si128(q, m4));
++            const __m128i u1 = _mm_shuffle_epi8(values, _mm_and_si128(_mm_srli_epi16(q, 4), m4));
++            const uint32_t eb = (uint32_t)x[i].e << 23; float dx; memcpy(&dx, &eb, 4);
++            for (int iy = 0; iy < ny; ++iy) {
++                const blk_q8_2 * yb = (const blk_q8_2 *)rows.y[iy] + i;
++                const __m128i s = dot32_us(u0, u1, yb->qs);
++                const int sum = _mm_cvtsi128_si32(sum4_epi32(s, s, s, s)) - 12*(int16_t)yb->s;
++                tail[iy] += dx*bf16_to_f32(yb->d)*(float)sum;
++            }
++        }
++        for (int iy = 0; iy < ny; ++iy) store(ix, iy, 0.5f*(hsum_ps(acc[iy]) + tail[iy]));
++    }
++}
++
++} // namespace avx1_gemv
+diff --git a/ggml/src/iqk/iqk_avx1_shim.h b/ggml/src/iqk/iqk_avx1_shim.h
+new file mode 100644
+index 00000000..978ef53b
+--- /dev/null
++++ b/ggml/src/iqk/iqk_avx1_shim.h
+@@ -0,0 +1,22 @@
++//
++// Force-included into the iqk sources when GGML_IQK_AVX1_SIMDE is on.
++// Lets the AVX2/FMA kernels build on AVX-only CPUs (Sandy Bridge): the 256-bit
++// integer and FMA intrinsics are provided by SIMDe on top of AVX/SSE4.
++//
++
++#pragma once
++
++#include <immintrin.h>
++
++#define SIMDE_X86_AVX2_NO_NATIVE
++#define SIMDE_X86_FMA_NO_NATIVE
++#define SIMDE_X86_F16C_NO_NATIVE
++#define SIMDE_ENABLE_NATIVE_ALIASES
++#include <simde/x86/avx2.h>
++#include <simde/x86/fma.h>
++#include <simde/x86/f16c.h>
++
++// Defined only after the system intrinsic headers are in, so they keep their
++// own target pragmas; from here on the iqk code takes its AVX2 paths.
++#define __AVX2__ 1
++#define __FMA__ 1
+diff --git a/ggml/src/iqk/iqk_gemm_legacy_quants.cpp b/ggml/src/iqk/iqk_gemm_legacy_quants.cpp
+index cf41a2e6..deb85870 100644
+--- a/ggml/src/iqk/iqk_gemm_legacy_quants.cpp
++++ b/ggml/src/iqk/iqk_gemm_legacy_quants.cpp
+@@ -3393,6 +3393,29 @@ bool iqk_convert_legacy_quants_q8_r8(int type, int n, const void * vx, size_t bx
+     return true;
+ }
+ 
++#ifdef GGML_IQK_AVX1_SIMDE
++#include "iqk_avx1_gemv.h"
++namespace {
++template <int ny> void mul_mat_q8_0_q8_2_avx1(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
++    avx1_gemv::Rows<ny> rows;
++    for (int iy = 0; iy < ny; ++iy) rows.y[iy] = info.src1_row(iy);
++    avx1_gemv::gemv_q8_0<ny>(n, vx, bx, rows, nrc_x, [&info](int ix, int iy, float v) { info.store(ix, iy, v); });
++}
++template <int ny> void mul_mat_mxfp4_q8_2_avx1(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
++    avx1_gemv::Rows<ny> rows;
++    for (int iy = 0; iy < ny; ++iy) rows.y[iy] = info.src1_row(iy);
++    avx1_gemv::gemv_mxfp4<ny>(n, vx, bx, rows, nrc_x, [&info](int ix, int iy, float v) { info.store(ix, iy, v); });
++}
++bool avx1_gemv_enabled() {
++    static const bool on = [] { const char * e = getenv("GGML_AVX1_GEMV"); return !e || atoi(e) != 0; }();
++    return on;
++}
++#define AVX1_GEMV_SET(f, funcs) \
++    funcs[0] = f<1>; funcs[1] = f<2>; funcs[2] = f<3>; funcs[3] = f<4>; \
++    funcs[4] = f<5>; funcs[5] = f<6>; funcs[6] = f<7>; funcs[7] = f<8>;
++}
++#endif
++
+ bool iqk_set_kernels_legacy_quants(int ne00, int typeA, int typeB, std::array<mul_mat_t, IQK_MAX_NY>& kernels, mul_mat_t& func16) {
+ 
+     if (ne00%QK8_0 != 0) return false;
+@@ -3424,7 +3447,10 @@ bool iqk_set_kernels_legacy_quants(int ne00, int typeA, int typeB, std::array<mu
+ #ifdef HAVE_FANCY_SIMD
+             set_functions<Q8_0_1_Unpacker>(kernels);
+ #else
+-            set_functions<Q8_0_Unpacker>(kernels);
++#ifdef GGML_IQK_AVX1_SIMDE
++            if (avx1_gemv_enabled()) { AVX1_GEMV_SET(mul_mat_q8_0_q8_2_avx1, kernels) } else
++#endif
++            { set_functions<Q8_0_Unpacker>(kernels); }
+ #endif
+             break;
+         case GGML_TYPE_IQ4_NL:
+@@ -3435,7 +3461,10 @@ bool iqk_set_kernels_legacy_quants(int ne00, int typeA, int typeB, std::array<mu
+ #endif
+             break;
+         case GGML_TYPE_MXFP4:
+-            set_functions<MXFP4_Unpacker>(kernels);
++#ifdef GGML_IQK_AVX1_SIMDE
++            if (avx1_gemv_enabled()) { AVX1_GEMV_SET(mul_mat_mxfp4_q8_2_avx1, kernels) } else
++#endif
++            { set_functions<MXFP4_Unpacker>(kernels); }
+             break;
+         case GGML_TYPE_IQ3_KS_R16:
+ #ifdef HAVE_FANCY_SIMD
+diff --git a/ggml/src/iqk/iqk_mul_mat.cpp b/ggml/src/iqk/iqk_mul_mat.cpp
+index 32c523aa..e90f38b4 100644
+--- a/ggml/src/iqk/iqk_mul_mat.cpp
++++ b/ggml/src/iqk/iqk_mul_mat.cpp
+@@ -630,6 +630,14 @@ extern "C" IQK_API bool iqk_mul_mat(long Nx, long Ny, long ne00,
+         if (!MulMat::prepare(typeA, typeB, ne00, mm, Ny)) {
+             return false;
+         }
++        if (Ny <= IQK_MAX_NY && MulMat::num_rows(ggml_type(typeA)) == 1) {
++            const int first_x = (int)(Nx*ith/nth), last_x = (int)(Nx*(ith + 1)/nth);
++            if (last_x > first_x) {
++                DataInfo info{C + first_x, (const char *)B, (size_t)stride_C, row_size_qy, 0, 1, nullptr, 0};
++                mm.mul_mat_NxM(ne00, (const char *)A + first_x*row_size_qx, row_size_qx, info, last_x - first_x, Ny);
++            }
++            return true;
++        }
+         const int min_step = Ny <= 16 ? 16 : 32;
+         int ntile_x = (Nx + min_step - 1)/min_step;
+         int ntile_y = (Ny + min_step - 1)/min_step;
+@@ -790,6 +798,24 @@ extern "C" IQK_API bool iqk_mul_mat_4d(long Nx, long Ny, long ne00,
+         return true;
+     }
+ 
++    if (ne13 == 1 && ne03 == 1 && ne02 > 1 && ne12 == ne02 && Ny <= IQK_MAX_NY && nb02 == Nx*strideA &&
++        MulMat::num_rows(ggml_type(typeA)) == 1) {
++        MulMat mm;
++        if (!MulMat::prepare(typeA, typeB, ne00, mm, Ny)) {
++            return false;
++        }
++        const long R = Nx*ne02;
++        const long r_end = R*(ith + 1)/nth;
++        for (long r = R*ith/nth; r < r_end; ) {
++            const long i02 = r/Nx, ix = r - i02*Nx;
++            const long n = std::min(r_end - r, Nx - ix);
++            DataInfo info{C + ix + i02*nb2, (const char *)B + i02*nb12, (size_t)stride_C, (size_t)strideB, 0, 1, nullptr, 0};
++            mm.mul_mat_NxM(ne00, (const char *)A + r*strideA, strideA, info, (int)n, (int)Ny);
++            r += n;
++        }
++        return true;
++    }
++
+     if (ne13 == 1 && ne12 > 1 && ne12 == ne02 && Ny == 1 && nb02 < strideA) {
+         MulMat mm;
+         if (!MulMat::prepare(typeA, typeB, ne00, mm, Ny)) {
 diff --git a/src/graphs/build_deepseek4.cpp b/src/graphs/build_deepseek4.cpp
 index 7f973c3a..c71b7c86 100644
 --- a/src/graphs/build_deepseek4.cpp
@@ -865,7 +1422,7 @@ index aba93035..d5db7522 100644
          }
          const auto * ew = get_weight(name.c_str());
 diff --git a/src/llama.cpp b/src/llama.cpp
-index e4e15885..15e8960a 100644
+index e4e15885..866ce601 100644
 --- a/src/llama.cpp
 +++ b/src/llama.cpp
 @@ -5418,6 +5418,25 @@ static bool llm_load_tensors(
@@ -874,7 +1431,7 @@ index e4e15885..15e8960a 100644
          }
 +
 +        // GGML_NUMA_PLACE=1: put row quarter k of every weight matrix on node k (pairs with
-+        // GGML_NUMA_BLOCKED=1). Lookup tables (token / Engram embeddings) are left where they are.
++        // GGML_NUMA_BLOCKED=1). Lookup tables (token / per-layer embeddings) are left where they are.
 +        if (const char * e = getenv("GGML_NUMA_PLACE"); e && atoi(e) && ggml_is_numa()) {
 +            const int64_t t0 = ggml_time_us();
 +            size_t placed = 0;
@@ -882,7 +1439,7 @@ index e4e15885..15e8960a 100644
 +            for (auto & it : model.tensors_by_name) {
 +                const ggml_tensor * t = it.second;
 +                if (!t->data || !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) continue;
-+                if (strstr(t->name, "engram") || strstr(t->name, "token_embd")) continue;
++                if (strstr(t->name, "engram_embd") || strstr(t->name, "token_embd")) continue;
 +                if (const size_t b = ggml_numa_place_tensor(t)) {
 +                    placed += b;
 +                    ++n_placed;
@@ -894,31 +1451,3 @@ index e4e15885..15e8960a 100644
  #if defined(_WIN32)
          // Without --defer-ple, fault sparse tables in synchronously (prefetch is best-effort).
          auto touch_host = [](struct ggml_tensor * t) {
-diff --git a/ggml/src/iqk/iqk_avx1_shim.h b/ggml/src/iqk/iqk_avx1_shim.h
-new file mode 100644
-index 00000000..978ef53b
---- /dev/null
-+++ b/ggml/src/iqk/iqk_avx1_shim.h
-@@ -0,0 +1,22 @@
-+//
-+// Force-included into the iqk sources when GGML_IQK_AVX1_SIMDE is on.
-+// Lets the AVX2/FMA kernels build on AVX-only CPUs (Sandy Bridge): the 256-bit
-+// integer and FMA intrinsics are provided by SIMDe on top of AVX/SSE4.
-+//
-+
-+#pragma once
-+
-+#include <immintrin.h>
-+
-+#define SIMDE_X86_AVX2_NO_NATIVE
-+#define SIMDE_X86_FMA_NO_NATIVE
-+#define SIMDE_X86_F16C_NO_NATIVE
-+#define SIMDE_ENABLE_NATIVE_ALIASES
-+#include <simde/x86/avx2.h>
-+#include <simde/x86/fma.h>
-+#include <simde/x86/f16c.h>
-+
-+// Defined only after the system intrinsic headers are in, so they keep their
-+// own target pragmas; from here on the iqk code takes its AVX2 paths.
-+#define __AVX2__ 1
-+#define __FMA__ 1

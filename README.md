@@ -32,7 +32,11 @@ This is a working log, not a polished project. The plan and all measurements are
 | Q8_0 vs BF16 dense quality | done: perplexity 3.5081 vs 3.4907 (+0.5%) |
 | tok/s: stock vs NUMA-local, thread counts (CPU) | done: ik NUMA-local **3.27 tok/s** (stock ik 2.60, mainline 1.58) |
 | GPU offload speed | done: **3.54 tok/s** with 20 layers' dense weights on the P2200 (CPU only 3.14) |
-| Phase 3: AVX1 kernel tuning, fewer barriers | next |
+| Phase 3a: decode profile | done: SIMDe GEMV at ~60 GB/s, libgomp barrier spin 27%, small matmuls on 2–32 of 64 threads |
+| Phase 3b: native 128-bit Q8_0 / MXFP4 GEMV kernels | done: 108–110 GB/s across 4 nodes in isolation (was ~60); decode 3.27 → 3.90 tok/s |
+| Phase 3c: two-level NUMA barrier, even split for small matmuls | done: 4.02 → **5.08 tok/s** |
+| Phase 3d: NUMA-local grouped wo_a, Engram projections placed | done: **5.66 tok/s** (171 ms/token) |
+| Phase 3e: flash attention, single-thread small ops, hc projections | next |
 
 First runs (60 threads, stock placement, Q8_0 dense):
 - ik_llama.cpp: **2.31 tok/s** decode, 5.3 tok/s prompt.
@@ -62,6 +66,11 @@ Estimate: ~6.5 tok/s NUMA-local on the CPU; ~12 with the dense part on the GPU a
 | `tools/placecheck.py` | Reports which node each weight's row quarters actually sit on (move_pages) |
 | `tools/splitpages.py` | Splits tmpfs huge pages to 4 KiB in place (pid/address debugfs form) |
 | `tools/rd2.c`, `tools/rdfile.c`, `tools/clearpol.c` | Bandwidth tests (4 KiB vs 2 MB pages, tmpfs files), policy reset |
+| `ik_llama/iqk_avx1_gemv.h`, `ik_llama/avx1_gemv_patch.py` | Native 128-bit Q8_0 and MXFP4 matrix × small-batch kernels for Sandy Bridge, hooked into iqk for 1–8 rows (`GGML_AVX1_GEMV=0` turns them off) |
+| `ik_llama/numa_barrier_patch.py` | Two-level NUMA barrier for `GGML_NUMA_BLOCKED` (`GGML_HBARRIER=0` off) and the `GGML_OP_PROF=1` per-op / per-weight profiler |
+| `ik_llama/small_split_patch.py` | Even row split for matmuls with < 32 rows per thread at small batch |
+| `ik_llama/grouped_split_patch.py` | NUMA-local split for grouped matmuls on a reshaped 2D weight (wo_a) |
+| `tools/gemv_bench.cpp` | Correctness and per-node bandwidth test for the AVX1 kernels |
 | `tools/mmcheck.c` | ggml `mul_mat` / `mul_mat_id` checker against a double-precision reference |
 | `tools/gguf_tensors.py` | Dependency-free GGUF tensor lister (name, type, shape, bytes) |
 | `tools/rd.c` | Read-bandwidth benchmark (256-bit loads, OpenMP) |

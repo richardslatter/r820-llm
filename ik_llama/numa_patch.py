@@ -180,7 +180,7 @@ patch(LLAMA_CPP,
         }
 
         // GGML_NUMA_PLACE=1: put row quarter k of every weight matrix on node k (pairs with
-        // GGML_NUMA_BLOCKED=1). Lookup tables (token / Engram embeddings) are left where they are.
+        // GGML_NUMA_BLOCKED=1). Lookup tables (token / per-layer embeddings) are left where they are.
         if (const char * e = getenv("GGML_NUMA_PLACE"); e && atoi(e) && ggml_is_numa()) {
             const int64_t t0 = ggml_time_us();
             size_t placed = 0;
@@ -188,7 +188,7 @@ patch(LLAMA_CPP,
             for (auto & it : model.tensors_by_name) {
                 const ggml_tensor * t = it.second;
                 if (!t->data || !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) continue;
-                if (strstr(t->name, "engram") || strstr(t->name, "token_embd")) continue;
+                if (strstr(t->name, "engram_embd") || strstr(t->name, "token_embd")) continue;
                 if (const size_t b = ggml_numa_place_tensor(t)) {
                     placed += b;
                     ++n_placed;
