@@ -148,6 +148,20 @@ llama-bench decode, Q8_0 dense weights (~12.7 GB/token), tmpfs on 4 KiB pages (`
 - NUMA-local placement: +26% over stock ik. ik: 2× mainline.
 - **3.27 tok/s × 12.7 GB ≈ 42 GB/s, against ~110 GB/s local bandwidth.** Decode is no longer memory-bound; the kernels (SIMDe-emulated AVX2 on AVX1) and per-op synchronisation are the bottleneck now. That is the Phase 3 custom-kernel work, which needs profiling first.
 
+## GPU offload speed (2026-10-30, after the GPU fixes)
+
+64 threads, `GGML_NUMA_BLOCKED=1`, NUMA-placed pages, `LLAMA_OT_CPU_MMAP=1 -ot exps=CPU` (all experts stay mmapped on the CPU):
+
+| Config | Prompt pp64 tok/s | Decode tg32 tok/s |
+|---|---|---|
+| CPU only (build-cpu) | 8.02 | 3.14 |
+| `-ngl 12` (2.1 GB dense on the P2200) | 7.51 | 3.33 |
+| **`-ngl 20`** | 7.79 | **3.54** |
+
+- The GPU gives +13% decode at 20 layers, and prompt speed is unchanged.
+- Decode is bound by CPU kernel compute and per-op synchronisation, not by bytes read: ~42 GB/s out of ~110. Moving dense weights off the CPU therefore only helps a little, and each offloaded layer adds CPU↔GPU syncs.
+- **Phase 0 is done.** Everything is measured and correct on both paths. The next gains are Phase 3: profile and hand-tune the AVX1 (SIMDe) MXFP4/Q8_0 kernels and cut per-op barriers.
+
 ## Q8_0 quality and GPU offload (2026-10-30)
 
 - **Q8_0 dense weights are near-lossless.** ik perplexity (same 6 × 256 wikitext chunks): BF16 dense (as downloaded) 3.4907, Q8_0 dense 3.5081 (+0.5%, inside ±0.31).
@@ -160,7 +174,12 @@ llama-bench decode, Q8_0 dense weights (~12.7 GB/token), tmpfs on 4 KiB pages (`
   - First reading, under the cap: 1.18 tok/s decode and 3.5 tok/s prompt, against ~0.7 CPU-only under the same throttle.
   - The GPU output is coherent but differs from the CPU text (different arithmetic for attention), so it needs the perplexity check.
   - **The perplexity check fails:** chunk 1 is **830.95** on the GPU configuration (`-ngl 12 -ot exps=CPU`, 256-token batches) against 1.4371 on the CPU. Batched evaluation on the offloaded layers is broken, which points at one of the DeepSeek-V4.1 ops on CUDA sm_61; single-token decode looked plausible. GPU numbers are not usable until this is found.
-    - **Cause, from reading ik's CUDA source at the base commit:** on Pascal, DeepSeek-V4.1 attention (K = V = 512, sparse indexer in `src[5]`) runs down `ggml_cuda_flash_attn_ext` like this:
+    - **Actual cause, found by tensor-by-tensor checksum comparison** (`llama-eval-callback`, CPU build vs CUDA build with one layer offloaded): CUDA's **in-place** flipped `ROPE_BACK`, which DeepSeek-V4.1 uses to de-rotate the attention output.
+      - Before the fix, the first divergence was `attn_wo_a` (7%), then `ffn_norm` 5.2 instead of 17.4.
+      - Making that rope out of place (`ds41_rope_back_patch.py`) brings the GPU within ~1% of the CPU.
+      - **GPU perplexity is now 3.5047** (CPU 3.5081, mainline 3.5073).
+      - The sink fix and a contiguous-input fix (`fattn_sinks_patch.py`, `ds41_wo_a_cont_patch.py`) are kept. They changed nothing measurable here: identical perplexity with and without, and identical with `-nkvo`.
+    - Earlier hypothesis (kept for the record), **from reading ik's CUDA source at the base commit:** on Pascal, DeepSeek-V4.1 attention (K = V = 512, sparse indexer in `src[5]`) runs down `ggml_cuda_flash_attn_ext` like this:
       1. the sparse MMA kernel needs tensor cores, so it fails;
       2. `ggml_cuda_dsa_attn_ext` (handles sinks) declines short contexts: KV length ≤ top-k 512, or < 2048 for batches ≤ 16;
       3. `is_pascal_hs512` → `ggml_cuda_flash_attn_ext_tile_new`, the Gemma-4 kernel, which **has no attention-sink support** (never reads `src[4]`).

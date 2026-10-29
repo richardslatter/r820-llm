@@ -28,10 +28,11 @@ This is a working log, not a polished project. The plan and all measurements are
 | NUMA-local placement (4 KiB pages, per-CPU pinning) | done: 99.7–100% of every row quarter on its node |
 | iDRAC 433 W user cap | fixed: 936 W |
 | iDRAC Node Manager policy 13 (343 W clamp) | fixed: pulled dead PSU1, Hot Spare off, cap off; cores hold 2.5 GHz under load |
-| GPU offload (dense on P2200, experts mmapped on CPU) | works with `LLAMA_OT_CPU_MMAP=1`; perplexity check pending |
+| GPU offload (dense on P2200, experts mmapped on CPU) | done: correct (perplexity 3.5047) after the rope-back fix |
 | Q8_0 vs BF16 dense quality | done: perplexity 3.5081 vs 3.4907 (+0.5%) |
 | tok/s: stock vs NUMA-local, thread counts (CPU) | done: ik NUMA-local **3.27 tok/s** (stock ik 2.60, mainline 1.58) |
-| GPU offload speed | next, after the attention-sink fix |
+| GPU offload speed | done: **3.54 tok/s** with 20 layers' dense weights on the P2200 (CPU only 3.14) |
+| Phase 3: AVX1 kernel tuning, fewer barriers | next |
 
 First runs (60 threads, stock placement, Q8_0 dense):
 - ik_llama.cpp: **2.31 tok/s** decode, 5.3 tok/s prompt.
@@ -49,6 +50,11 @@ Estimate: ~6.5 tok/s NUMA-local on the CPU; ~12 with the dense part on the GPU a
 | `ik_llama/r820.patch` | All local changes to ik_llama.cpp (AVX1 SIMDe build + NUMA-local engine), including the new shim header |
 | `ik_llama/numa_patch.py` | Script that applies the NUMA part of the patch to a clean checkout |
 | `ik_llama/mxfp8_patch.py` | Adds the MXFP8 type (gather-only) to ik or mainline; the Engram table needs it |
+| `ik_llama/ds41_rope_back_patch.py` | Out-of-place attention rope-back: fixes the CUDA (sm_61) path for DeepSeek-V4.1 |
+| `ik_llama/fattn_sinks_patch.py` | Attention sinks in ik's Pascal head-size-512 flash-attention kernel |
+| `ik_llama/ds41_wo_a_cont_patch.py` | Contiguous input for the grouped output projection's batched matmul |
+| `scripts/restore-ramdisk.sh` | Refill the RAM disk from the NAS after a power cycle |
+| `system/net/` | `net-reconnect.service`: retry DHCP once a minute after a cable-less boot |
 | `ik_llama/ds41_gguf_patch.py` | Lets ik load DeepSeek-V4.1 GGUFs in the Unsloth/mainline layout |
 | `mainline/mxfp8.patch` | The MXFP8 change as applied to mainline llama.cpp |
 | `tools/requant_shard.c` | Requantizes the BF16 tensors of one GGUF shard, copying the rest |
