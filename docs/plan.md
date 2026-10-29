@@ -132,7 +132,13 @@ Greedy 16-token completion of a fixed prompt, 60 threads, `--numa distribute`, m
   - First reading, under the cap: 1.18 tok/s decode and 3.5 tok/s prompt, against ~0.7 CPU-only under the same throttle.
   - The GPU output is coherent but differs from the CPU text (different arithmetic for attention), so it needs the perplexity check.
   - **The perplexity check fails:** chunk 1 is **830.95** on the GPU configuration (`-ngl 12 -ot exps=CPU`, 256-token batches) against 1.4371 on the CPU. Batched evaluation on the offloaded layers is broken, which points at one of the DeepSeek-V4.1 ops on CUDA sm_61; single-token decode looked plausible. GPU numbers are not usable until this is found.
-    - Suspect: DeepSeek-V4.1 attention has 512-wide heads (key/value length 512). Batched CUDA flash attention uses tile/MMA kernels, and Pascal has no tensor cores, so it takes a fallback that may not handle D=512; single-token decode uses the vector kernel. Test: perplexity with `-fa 0`, and with attention kept on the CPU.
+    - **Cause, from reading ik's CUDA source at the base commit:** on Pascal, DeepSeek-V4.1 attention (K = V = 512, sparse indexer in `src[5]`) runs down `ggml_cuda_flash_attn_ext` like this:
+      1. the sparse MMA kernel needs tensor cores, so it fails;
+      2. `ggml_cuda_dsa_attn_ext` (handles sinks) declines short contexts: KV length ≤ top-k 512, or < 2048 for batches ≤ 16;
+      3. `is_pascal_hs512` → `ggml_cuda_flash_attn_ext_tile_new`, the Gemma-4 kernel, which **has no attention-sink support** (never reads `src[4]`).
+      So every short-context GPU attention drops the per-head `attn_sinks`, decode included; the coherent decode text was luck. Sparse indices are also only turned into a mask when no mask exists.
+    - Workaround to test: `-nkvo`, keeping the KV cache and the attention op on the CPU and only the projections on the GPU.
+    - Proper fix (custom kernel): sinks in `tile_new`'s online softmax. Seed each head's running max with its sink logit and the running sum with 1 (exp(sink − max) after rescaling).
 
 ## Model facts (measured from the GGUF, 2026-10-29)
 
