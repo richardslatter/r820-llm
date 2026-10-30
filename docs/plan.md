@@ -623,6 +623,8 @@ What is left at batch 4 (~290 ms per graph):
 - The f32 router (`ffn_gate_inp`, 384 rows, ~6 ms).
 - HC_POST 6 ms, RMS norms 5 ms.
 
+**The K-slice does not help the router.** Taking the 384-row router through the same path (weights placed by column quarters too) doubled the f32 matmuls at batch 4 (10.5 → 19.5 ms per graph) and slowed decode (6.59 / 6.84 → 6.35 / 6.17 tok/s). Each thread then reads 384 strided 256-byte pieces, which costs more than the remote activation reads it saves. Not kept.
+
 **HC_POST order.** Token-major tasks give thread *i* a few whole tokens, so it reads columns that 64 other threads wrote in the matmul before. Chunk-major tasks (now the default; `GGML_HC_POST_SPLIT=1` for token-major) give it the same 64 columns of every token, which is exactly what its share of that matmul wrote. Output is bit-identical. HC_POST itself did not get faster (6.1 vs 6.5 ms), but the op that next reads its output, MUL_MULTI_ADD, went 3.4 → 2.1 ms (per-thread average 2.85 → 1.05), and the batch-4 graph went 289.8 → 286.9 ms. `pp4` was 13.08 / 12.80 vs 13.07 / 13.11 tok/s, within the noise.
 
 ## Ideas for cutting the per-token weight read (2026-10-30)
