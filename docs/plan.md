@@ -226,6 +226,160 @@ Still open in Phase 3e:
 - ~2 ms in ROPE.
 - The q6_K small matmuls (`qr` 83 µs, `kv_b` 56 µs).
 
+## Where the decode time goes, and kernel speed on AVX1 (2026-10-30)
+
+**Per-token breakdown** at 512 tokens of context, dq6k, 161.5 ms per token:
+- The node loop takes 153.9 ms.
+- Graph build 2.3 ms, scheduler allocation 3.0 ms, the rest of the host side ~2 ms.
+- Graph reuse never happens for DeepSeek-V4: the model-state hash includes the compression-plan sizes and n_kv, which change every token. Reuse would need dynamic shapes, so it isn't worth chasing for ~7 ms.
+
+**Matmuls in the model** (op profile, per token):
+
+| Weights | ms | GB/s |
+|---|---|---|
+| Experts up+gate (MXFP4) | 31.4 | 96 |
+| Experts down (MXFP4) | 15.8 | 95 |
+| `attn_output_b`, `attn_q_b` (Q6_K) | 14.3, 13.5 | 96, 102 |
+| `attn_output_a` (Q6_K) | 13.8 | 80 |
+| `output` (Q6_K) | 5.0 | 108 |
+| `ffn_down_shexp` (Q6_K) | 4.9 | 78 |
+| `ffn_gate_inp` (f32) | 4.4 | 71 |
+| `attn_q_a` (Q6_K) | 3.9 | 55 |
+| `attn_kv` (Q6_K, 5120 × 512) | 3.1 | 28 |
+| `hc_attn_fn` + `hc_ffn_fn` (f32, 20480 × 24) | 4.8 | 32 |
+
+The big matmuls are near the ~110 GB/s the memory gives. The small ones lose ~12 ms between them.
+
+**Kernel speed by type** (`tools/mm_bench.c`). One thread, weights in L2 (4096 × 32), so this is the arithmetic alone. Native means a hand-written AVX1 kernel (`iqk_avx1_gemv.h`); everything else goes through SIMDe's AVX2 emulation.
+
+| Type | GB/s per core | Kernel |
+|---|---|---|
+| Q8_0 | 5.0 | native |
+| Q6_K | 2.9 | native |
+| MXFP4 | 2.7 | native |
+| IQ4_NL | 2.4 | native |
+| Q5_K, Q4_K, Q4_0 | 1.8–1.9 | SIMDe |
+| IQ4_XS, IQ4_KS, IQ4_K | 1.3 | SIMDe |
+| IQ5_KS, IQ5_K, Q6_0 | 1.1 | SIMDe |
+| IQ6_K | 0.7 | SIMDe |
+
+- Filling 110 GB/s from 32 cores takes ~3.4 GB/s per core (a little less with both hyper-threads).
+- So Q6_K and MXFP4 are already at the compute limit, and every SIMDe type would be compute-bound well below the memory speed.
+- A lower-bit dense format only pays off with a native kernel at least as fast as IQ4_NL's. That is a precondition for the mixed dense quant idea below.
+- The row-interleaved `_r4`/`_r8` layouts are slower here too: no native kernels.
+- At 64 threads with the weights streaming from DRAM, Q6_K and Q8_0 move about the same bytes per second (74 vs 71.5 GB/s). Q6_K wins on time because it is smaller.
+
+**Correction: mm_bench and huge pages.** Transparent huge pages are on (`always`) for anonymous memory, and mm_bench's weights were anonymous. `ggml_numa_place_tensor` binds each quarter of a tensor to its node, but a quarter that only covers part of a 2 MB page cannot be moved. `mbind` still returns success, so the tool reported 100% placed while most of a small tensor stayed on the node that wrote it. mm_bench now maps its buffer with `MADV_NOHUGEPAGE`, as the model's tmpfs pages are 4 KB anyway. Before and after, 64 threads:
+
+| Matmul | Huge pages | 4 KB pages |
+|---|---|---|
+| f32 20480 × 24 (`hc_*_fn`) | 80 µs, 25 GB/s | 25 µs, 77 GB/s |
+| f32 5120 × 384 (`ffn_gate_inp`) | 328 µs, 24 GB/s | 83 µs, 95 GB/s |
+| Q8_0 5120 × 384 | 52 µs, 40 GB/s | 21 µs, 102 GB/s |
+| Q6_K 5120 × 384 | 30 µs, 54 GB/s | 17 µs, 94 GB/s |
+
+This replaces an earlier note here that small Q6_K matmuls were compute-bound (53 µs for 5120 × 512); that was the same artefact. With 4 KB pages, 5120 × 512 takes 22 µs (97 GB/s) streaming, and Q8_0 27 µs (104 GB/s). In a graph of only 4 matmuls, the graph launch makes it ~47 µs.
+
+So small matmuls reach the memory speed when run alone. In the model they don't: `attn_kv` (5120 × 512) takes 77 µs per call and `hc_*_fn` ~60 µs, against 22 and 25 µs here, about 12 ms per token in all. The weights are placed, so the suspect was the input, which threads on all four sockets have just written.
+
+**Negative result, node-local activation copy** (`mm_f32_decode_patch.py`). For f32 matmuls with one input row, the threads of each node first copied the row into a per-node buffer and then computed from that copy. Where there were fewer rows than threads, each row was also split along K. In mm_bench, the hc shape got slower (25 → 40 µs) and `gate_inp` was unchanged. In the model (two alternating runs each, tg32 / tg32@pp512):
+- Off: 6.74 / 6.18 and 6.59 / 6.10 tok/s.
+- On: 6.39 / 5.89 and 6.60 / 6.13 tok/s.
+
+So there was no gain, and it is not applied. Together with the per-thread quantisation result below, this suggests the in-model gap for small matmuls is not activation traffic. Load imbalance carried in from the previous op is the next suspect, but it is unmeasured: no `perf` on this box.
+
+An earlier split-K-only version, without the node-local copy, was also slower.
+
+**Negative result, per-thread activation quantisation** (`mm_localq_patch.py`). Each thread converted the single activation row itself instead of thread 0 converting it and everyone waiting at a barrier. 6.07 against 6.05 tok/s: no gain. It is not applied.
+
+**Lesson:** killing a benchmark binary over ssh does not stop the shell loop that started it. A stray 64-thread job made a later decode run 40× slower (0.16 tok/s). Kill the loop's shell too, and check `top` before each benchmark.
+
+## Smart expert reduction (`-ser`), measured (2026-10-30)
+
+In this tree `-ser` did nothing: the call was commented out. `ik_llama/ser_patch.py` turns it back on, with three changes:
+- a top-k selection in place of the bubble sort;
+- the threshold applied to the unbiased weights;
+- zero-weight slots skipped when the expert outputs are summed.
+
+It is faster, but the quality cost is too high, so it stays opt-in. dq6k itself has KLD 0.018 against Q8.
+
+| `-ser` | Speed | KLD |
+|---|---|---|
+| 5,1 | +5% | 0.066 |
+| 4,1 | +9% | 0.151 |
+
+## Speculative decoding without a draft model (2026-10-30)
+
+The GGUF has no MTP/nextn tensors, so only draft-free methods are possible. The question is the cost of verifying a batch: each extra token in the batch brings its own experts.
+
+Verify cost (`llama-bench -p N`, dq6k, 64 threads):
+
+| Tokens in batch | 1 | 2 | 3 | 4 | 6 | 8 | 16 |
+|---|---|---|---|---|---|---|---|
+| ms per batch | 144 | 225 | 289 | 345 | 462 | 561 | 1088 |
+| × one token | 1.0 | 1.56 | 2.0 | 2.4 | 3.2 | 3.9 | 7.5 |
+
+So a draft must be accepted most of the time to pay off, and long drafts never do.
+
+`llama-spec-bench`, built-in tasks, 192 tokens, greedy, tok/s (one run each, noise about ±0.2):
+
+| Setting | code | extract | story |
+|---|---|---|---|
+| No drafting | 6.44 | 6.08 | 6.42 |
+| `suffix:n_max=2,n_min=1` | 6.75 | 6.77 | 6.47 |
+| `suffix:n_max=3,n_min=1` | 6.64 | 6.72 | 6.50 |
+| `suffix:n_max=4,n_min=2` | 6.87 | 6.59 | 6.30 |
+| `suffix:n_max=8,n_min=2` | 6.05 | 4.76 | 6.46 |
+| `ngram-mod:n_max=3,n_min=1` | 6.36 | 5.95 | 6.24 |
+| `ngram-mod:n_max=8,n_min=2` | 6.59 | 5.46 | 6.56 |
+
+- **Suffix drafting with short drafts is a small, free win.** It gives +5–11% where the output repeats text from the prompt (code, extraction) and nothing on free prose, where it never drafts.
+- `n_max=2` was the most even: 96% first-token acceptance on extract.
+- Long drafts lose even at 93% first-token acceptance, as the verify table predicts.
+- `ngram-mod` drafts rarely and accepts less.
+- The gain should be larger in multi-turn chats and code edits that repeat earlier text.
+
+Recommended server flag: `--spec-type suffix:n_max=2,n_min=1`.
+
+Note: `--jinja` with the GGUF's own template fails in ik's jinja engine ("Callee is not a function"). The server works around this with `--chat-template-file`.
+
+## Ideas for cutting the per-token weight read (not yet tried, 2026-10-30)
+
+At dq6k each token reads ~10.9 GB: experts 4.5, dense 6.1, f32 router/hc 0.3. That is ~98 ms at 110 GB/s. None of the following has been run yet. They are listed best first.
+
+1. **2 DIMMs per channel at 1600 MT/s** (+20% bandwidth, ~98 → ~82 ms).
+   - The DIMMs are rated 1600; 3 per channel caps them at 1333.
+   - This was ruled out in Phase 2 because 512 GiB was too small for the Q8 download. dq6k needs only ~465 GiB (experts 269 + Engram table 189 + dense 6), which leaves ~40 GiB if the tmpfs holds only dq6k.
+   - Optional: quantise the Engram table (MXFP8, lookup only) to 4-bit for ~100 GB more headroom, at no speed cost.
+   - You'd need to pull 16 sticks, one per channel. Then check that the BIOS reports 1600 at 2 per channel, and refill from the NAS (~72 min).
+   - Biggest unknown: whether the R820 actually runs 1600 at 2 per channel.
+2. **ik's smart expert reduction (`-ser`).**
+   - 5 of 6 experts saves ~0.75 GB, ~7 ms per token.
+   - A threshold variant saves less but is safer.
+   - Needs only a KLD check.
+3. **Imatrix-guided mixed dense quant** (IQ5_KS/IQ4_KS, ~5 bpw).
+   - `diq4` was made without an imatrix, which is likely why its KLD is 0.082 against 0.018.
+   - Target: dq6k-level KLD with dense 6.1 → ~4.7 GB, ~13 ms per token.
+   - Cost: an imatrix run, and possibly AVX1 kernels for those types.
+4. **Shared expert on the P2200** running alongside the CPU routed experts. Hides ~1.15 GB, ~10 ms per token; needs the engine to run GPU and CPU splits in parallel.
+5. **Speculative decoding with no download.**
+   - Prompt-lookup (n-gram) drafting.
+   - Check whether the GGUF has MTP/nextn tensors.
+   - The DSpark drafter isn't in the download, so it needs your permission first.
+   - Dense reads amortise across drafted tokens; expert reads mostly don't.
+6. **Smaller items:**
+   - Output head at 4-bit: ~2–3 ms.
+   - Experts below native FP4: ~1.2 GB, but likely a real quality loss; low priority.
+
+Ruled out:
+- 2 MB vs 4 KiB pages: measured equal.
+- BIOS settings: prefetchers, interleave, profile and turbo are already right.
+- Non-temporal loads: no effect on write-back memory.
+- Compression: AVX1 is compute-bound.
+- Caching hot experts: ~75 MB per layer against 16 MB of L3.
+
+Estimate for 1 + 2 + 3 together: ~8.6 GB at ~132 GB/s, ~72 ms read + ~23 ms other, so ~10.5 tok/s CPU-only against ~7.1. Speculative decoding on top could give ~13–15.
+
 ## Model facts (measured from the GGUF, 2026-10-29)
 
 Unsloth UD-Q8_K_XL: 474 GiB in 9 shards (SHA256 verified on the NAS), at `nas.local:/volume1/@home/richard/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-Q8_K_XL`. 40 layers, all MoE: 384 routed experts (6 active) plus 1 shared expert per layer. 4 hyper-connection streams (`embedding_length_out` 20480).
@@ -292,7 +446,7 @@ Decode speed ≈ usable bandwidth ÷ bytes per token. **The BF16 dense weights a
 2. Repeat the Phase 1 tuning.
 3. GPU: with the dense part at ~4.5 bits (~4.4 GB) it may fit on the 5 GB P2200, leaving only the experts for the CPU.
 4. Quality check against the BF16 original: perplexity plus your own prompts.
-5. RAM test (2 DIMMs per channel at 1600) is off the table: 512 GB is too small for the 474 GiB model.
+5. RAM test (2 DIMMs per channel at 1600) is off the table: 512 GB is too small for the 474 GiB model. *Reopened:* dq6k needs only ~465 GiB (see "Ideas for cutting the per-token weight read").
 6. **Expected: ~6.5 tok/s with Q8_0 dense on the CPU; ~12 with ~4.5-bit dense on the GPU and experts NUMA-local on the CPU.**
 
 ### Phase 3: rewrite ik's fast routines for AVX

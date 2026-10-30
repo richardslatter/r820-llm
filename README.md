@@ -39,7 +39,9 @@ This is a working log, not a polished project. The plan and all measurements are
 | Phase 3e: exact vector fp16 for AVX1, decode flash attention for the shared K/V head | done: attention 15% faster, perplexity 3.5485 → 3.4919 (fp32 accumulation) |
 | Phase 3e: dense format (Q8_0 / Q6_K / IQ4_NL kernels at 106–110 GB/s) | done: **Q6_K** picked, KLD 0.018 vs BF16, decode 5.94 → 6.52 tok/s |
 | Phase 3e: lazy K/V concat, column-split norms and small ops | done: **6.68 tok/s** (6.17 after a 512-token prompt) |
-| Phase 3e: hc_pre matmuls, ROPE, small q6_K matmuls (~7 ms/token) | in progress (split-K tried: slower) |
+| Phase 3e: small matmuls in the model (~12 ms/token above their standalone time) | open: split-K, per-thread activation quantisation and node-local activation copies all tried, no gain |
+| Smart expert reduction (`-ser`) re-enabled | done, opt-in only: +5–9% decode but KLD 0.066–0.151 |
+| Draft-free speculative decoding | done: `--spec-type suffix:n_max=2,n_min=1` gives +5–11% where output repeats the prompt, 0 on free prose; no MTP tensors in the GGUF |
 
 First runs (60 threads, stock placement, Q8_0 dense):
 - ik_llama.cpp: **2.31 tok/s** decode, 5.3 tok/s prompt.
@@ -80,6 +82,9 @@ Estimate: ~6.5 tok/s NUMA-local on the CPU; ~12 with the dense part on the GPU a
 | `ik_llama/decode_ops_patch.py` | Vector RMS-norm sums, column split for `MUL_MULTI_ADD` at batch 1, `GGML_OP_PROF=3` per-node trace |
 | `ik_llama/norm_split_patch.py` | Column-split RMS norms for long single rows (`GGML_NORM_SPLIT=0` off) |
 | `tools/fa_bench.c`, `tools/hc_bench.c` | Decode attention and hyper-connection norm + matmul in isolation |
+| `tools/mm_bench.c` | Decode matmuls (one activation row) of any type in isolation, NUMA-placed, on 4 KB pages |
+| `ik_llama/ser_patch.py` | Re-enables `-ser`: top-k selection, threshold on the unbiased weights, zero-weight slots skipped |
+| `ik_llama/mm_localq_patch.py`, `ik_llama/mm_f32_decode_patch.py` | Negative results, kept for reference: per-thread activation quantisation, node-local f32 activation copy |
 | `tools/f16c_test.cpp` | Exhaustive check of the fp16 conversions |
 | `tools/serve.sh`, `tools/v4_chat.jinja` | LAN chat server (llama-server, web UI on :8080) and a plain chat template it can parse |
 | `tools/mmcheck.c` | ggml `mul_mat` / `mul_mat_id` checker against a double-precision reference |
