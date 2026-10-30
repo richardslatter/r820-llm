@@ -1,0 +1,20 @@
+{#- Plain chat subset of the DeepSeek-V4.1 template (the GGUF one calls dict(), which the server engine lacks). No tools or images. Non-thinking unless enable_thinking is passed in chat_template_kwargs. -#}
+{#- Markers the server keys its DeepSeek-V4.1 parser on (reasoning split): dsml_token ｜DSML｜ ' calls> ' invoke -#}
+{%- set think = enable_thinking is defined and enable_thinking -%}
+{%- set ns = namespace(last_user=-1) -%}
+{%- for m in messages -%}{%- if m.role == "user" -%}{%- set ns.last_user = loop.index0 -%}{%- endif -%}{%- endfor -%}
+{{- "<｜begin▁of▁sentence｜>" -}}
+{%- if think -%}{{- "<｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n" -}}{%- endif -%}
+{%- for m in messages -%}
+    {%- if m.role == "system" -%}
+        {%- if loop.index0 > 0 or not think -%}{{- "<｜System｜>" -}}{%- endif -%}
+        {{- m.content or "" -}}
+    {%- elif m.role == "user" -%}
+        {{- "<｜User｜>" ~ (m.content or "") -}}
+    {%- elif m.role == "assistant" -%}
+        {{- (m.content or "") ~ "<｜end▁of▁sentence｜>" -}}
+    {%- endif -%}
+    {%- if m.role != "assistant" and ((loop.last and add_generation_prompt) or (not loop.last and messages[loop.index0 + 1].role == "assistant")) -%}
+        {{- "<｜Assistant｜>" ~ ("<think>" if think and loop.index0 >= ns.last_user else "</think>") -}}
+    {%- endif -%}
+{%- endfor -%}

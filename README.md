@@ -36,7 +36,10 @@ This is a working log, not a polished project. The plan and all measurements are
 | Phase 3b: native 128-bit Q8_0 / MXFP4 GEMV kernels | done: 108–110 GB/s across 4 nodes in isolation (was ~60); decode 3.27 → 3.90 tok/s |
 | Phase 3c: two-level NUMA barrier, even split for small matmuls | done: 4.02 → **5.08 tok/s** |
 | Phase 3d: NUMA-local grouped wo_a, Engram projections placed | done: **5.66 tok/s** (171 ms/token) |
-| Phase 3e: flash attention, single-thread small ops, hc projections | next |
+| Phase 3e: exact vector fp16 for AVX1, decode flash attention for the shared K/V head | done: attention 15% faster, perplexity 3.5485 → 3.4919 (fp32 accumulation) |
+| Phase 3e: dense format (Q8_0 / Q6_K / IQ4_NL kernels at 106–110 GB/s) | done: **Q6_K** picked, KLD 0.018 vs BF16, decode 5.94 → 6.52 tok/s |
+| Phase 3e: lazy K/V concat, column-split norms and small ops | done: **6.68 tok/s** (6.17 after a 512-token prompt) |
+| Phase 3e: hc_pre matmuls, ROPE, small q6_K matmuls (~7 ms/token) | in progress (split-K tried: slower) |
 
 First runs (60 threads, stock placement, Q8_0 dense):
 - ik_llama.cpp: **2.31 tok/s** decode, 5.3 tok/s prompt.
@@ -71,10 +74,18 @@ Estimate: ~6.5 tok/s NUMA-local on the CPU; ~12 with the dense part on the GPU a
 | `ik_llama/small_split_patch.py` | Even row split for matmuls with < 32 rows per thread at small batch |
 | `ik_llama/grouped_split_patch.py` | NUMA-local split for grouped matmuls on a reshaped 2D weight (wo_a) |
 | `tools/gemv_bench.cpp` | Correctness and per-node bandwidth test for the AVX1 kernels |
+| `ik_llama/iqk_avx1_shim.h` | Force-included into iqk for the SIMDe AVX1 build |
+| `ik_llama/iqk_avx1_f16c.h`, `ik_llama/ggml_f16_avx1_patch.py` | Exact vector fp16 ↔ fp32 without F16C, for iqk and ggml.c |
+| `ik_llama/ds4_fa_mqa_kernel.c`, `ik_llama/ds4_fa_mqa_patch.py` | Decode flash attention for one shared fp16 K/V head, and the lazy K/V concat (`GGML_FA_MQA=0`, `GGML_FA_LAZY=0` off) |
+| `ik_llama/decode_ops_patch.py` | Vector RMS-norm sums, column split for `MUL_MULTI_ADD` at batch 1, `GGML_OP_PROF=3` per-node trace |
+| `ik_llama/norm_split_patch.py` | Column-split RMS norms for long single rows (`GGML_NORM_SPLIT=0` off) |
+| `tools/fa_bench.c`, `tools/hc_bench.c` | Decode attention and hyper-connection norm + matmul in isolation |
+| `tools/f16c_test.cpp` | Exhaustive check of the fp16 conversions |
+| `tools/serve.sh`, `tools/v4_chat.jinja` | LAN chat server (llama-server, web UI on :8080) and a plain chat template it can parse |
 | `tools/mmcheck.c` | ggml `mul_mat` / `mul_mat_id` checker against a double-precision reference |
 | `tools/gguf_tensors.py` | Dependency-free GGUF tensor lister (name, type, shape, bytes) |
 | `tools/rd.c` | Read-bandwidth benchmark (256-bit loads, OpenMP) |
-| `scripts/` | Build and perplexity-check scripts used on the server |
+| `scripts/` | Build, perplexity, KL-divergence (`kld1.sh`, `kldub1.sh`), decode-speed (`tgd.sh`), op-profile (`opprof.sh`) and greedy-output (`greedy.sh`) scripts used on the server |
 | `system/` | OS tuning files as installed on the server |
 | `idrac/` | WS-Man request for aborting a pending BIOS configuration |
 
@@ -108,6 +119,8 @@ gcc -O2 -march=native -fopenmp -I$ML/ggml/include tools/requant_shard.c -o requa
 mkdir -p /mnt/models/dq8 && for i in 1 2 3 4 5 6 7 8; do ln /mnt/models/UD-Q8_K_XL/*-0000$i-of-00009.gguf /mnt/models/dq8/; done
 ./requant_shard /mnt/models/UD-Q8_K_XL/*-00009-of-00009.gguf /mnt/models/dq8/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00009-of-00009.gguf q8_0 token_embd.weight=keep
 ```
+
+The variant in use now, `dq6k`, is made the same way with `q6_K` as the type (`iq4_nl output.weight=q6_K` for `diq4`). The plan compares the three.
 
 ## Tools
 

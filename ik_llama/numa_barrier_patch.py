@@ -8,7 +8,7 @@ flag per node so every waiting thread spins on a line held by its own socket. De
 ~1500 barriers per token and the flat libgomp barrier bounces one line between 4 sockets.
 GGML_HBARRIER=0 turns it off.
 
-GGML_OP_PROF=1 makes thread 0 time every node: wall time from node start to barrier exit and
+GGML_OP_PROF=1 (=2: only graphs of <= 8 tokens) makes thread 0 time every node: wall time from node start to barrier exit and
 the slowest thread's compute time, accumulated per op (and weight type for matmuls), printed
 at exit. wall - slowest compute = barrier cost; slowest - average = load imbalance.
 """
@@ -193,7 +193,8 @@ sub("""    set_numa_thread_affinity(state->ith, state->shared->n_threads);
     if (state->shared->hb_n_nodes > 1) {
         g_hb_node = state->ith*state->shared->hb_n_nodes/state->shared->n_threads;
     }
-    const bool prof = g_prof_on > 0 && state->shared->n_threads <= 512;
+    // GGML_OP_PROF=2: decode-sized graphs (<= 8 tokens) only
+    const bool prof = g_prof_on > 0 && state->shared->n_threads <= 512 && (g_prof_on == 1 || state->shared->n_batch <= 8);
     if (prof && state->ith == 0) g_prof_graphs++;
 """)
 
@@ -271,7 +272,7 @@ sub("""    int n_threads = cplan->n_threads;
 
     if (g_prof_on < 0) {
         const char * e = getenv("GGML_OP_PROF");
-        g_prof_on = e && atoi(e) != 0;
+        g_prof_on = e ? atoi(e) : 0;
         if (g_prof_on) {
             g_prof_tsc0 = (int64_t)__rdtsc();
             g_prof_us0  = ggml_time_us();

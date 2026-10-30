@@ -1,6 +1,6 @@
 // Correctness and bandwidth test for ik_llama/iqk_avx1_gemv.h.
 //   g++ -O3 -march=native -std=c++17 -pthread -I../ik_llama gemv_bench.cpp -o gemv_bench
-//   ./gemv_bench <q8_0|mxfp4> <ny> <threads per node> <nodes> [MiB per node] [n]
+//   ./gemv_bench <q8_0|mxfp4|iq4_nl|q6_K> <ny> <threads per node> <nodes> [MiB per node] [n]
 // Each node gets its own weight matrix (first-touched by a thread on that node) and threads pinned to its CPUs.
 #include "iqk_avx1_gemv.h"
 
@@ -21,6 +21,18 @@
 using namespace avx1_gemv;
 
 static const int8_t kvalues_mxfp4[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+static const int8_t kvalues_iq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+
+enum { T_Q8_0, T_MXFP4, T_IQ4_NL, T_Q6_K };
+
+static size_t row_bytes(int type, int n) {
+    switch (type) {
+        case T_Q8_0:   return (size_t)(n/32)*34;
+        case T_MXFP4:  return (size_t)(n/32)*17;
+        case T_IQ4_NL: return (size_t)(n/32)*18;
+        default:       return (size_t)(n/256)*210;
+    }
+}
 
 // no F16C on Sandy Bridge
 static uint16_t f32_to_fp16(float f) {
@@ -96,11 +108,33 @@ static double ref_row(int type, int n, const char * xrow, const char * y) {
         if (i < nb4) get_q8(y, i, dy, qy);
         else { const blk_q8_2 * b = (const blk_q8_2 *)y + i; dy = bf16_to_f32(b->d); qy = b->qs; }
         double s = 0;
-        if (type == 0) {
+        if (type == T_Q8_0) {
             const blk_q8_0 * b = (const blk_q8_0 *)xrow + i;
             double dx = fp16_ref(b->d);
             for (int j = 0; j < 32; ++j) s += b->qs[j]*qy[j];
             acc += dx*dy*s;
+        } else if (type == T_IQ4_NL) {
+            const blk_iq4_nl * b = (const blk_iq4_nl *)xrow + i;
+            double dx = fp16_ref(b->d);
+            for (int j = 0; j < 16; ++j) s += kvalues_iq4nl[b->qs[j] & 15]*qy[j] + kvalues_iq4nl[b->qs[j] >> 4]*qy[j+16];
+            acc += dx*dy*s;
+        } else if (type == T_Q6_K) {
+            // weights of 32-block i straight from ggml's dequantize_row_q6_K layout
+            const blk_q6_K * b = (const blk_q6_K *)xrow + i/8;
+            const int half = (i%8)/4, k = i%4;
+            const uint8_t * ql = b->ql + 64*half; const uint8_t * qh = b->qh + 32*half; const int8_t * sc = b->scales + 8*half;
+            for (int j = 0; j < 32; ++j) {
+                const int l = j;  // position inside the 32-block
+                int q;
+                switch (k) {
+                    case 0: q = (ql[l] & 0xF)      | (((qh[l] >> 0) & 3) << 4); break;
+                    case 1: q = (ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4); break;
+                    case 2: q = (ql[l] >> 4)       | (((qh[l] >> 4) & 3) << 4); break;
+                    default: q = (ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4); break;
+                }
+                s += (double)sc[2*k + l/16]*(q - 32)*qy[j];
+            }
+            acc += fp16_ref(b->d)*dy*s;
         } else {
             const blk_mxfp4 * b = (const blk_mxfp4 *)xrow + i;
             double dx = std::ldexp(1.0, (int)b->e - 128);
@@ -115,8 +149,12 @@ template <int ny>
 static void run_kernel(int type, int n, const char * x, size_t bx, const char * const * y, float * out, int nrows) {
     Rows<ny> rows; for (int iy = 0; iy < ny; ++iy) rows.y[iy] = y[iy];
     auto store = [out, nrows](int ix, int iy, float v) { out[iy*nrows + ix] = v; };
-    if (type == 0) gemv_q8_0<ny>(n, x, bx, rows, nrows, store);
-    else           gemv_mxfp4<ny>(n, x, bx, rows, nrows, store);
+    switch (type) {
+        case T_Q8_0:   gemv_q8_0<ny>(n, x, bx, rows, nrows, store); break;
+        case T_MXFP4:  gemv_mxfp4<ny>(n, x, bx, rows, nrows, store); break;
+        case T_IQ4_NL: gemv_iq4_nl<ny>(n, x, bx, rows, nrows, store); break;
+        default:       gemv_q6_K<ny>(n, x, bx, rows, nrows, store); break;
+    }
 }
 
 static void dispatch(int ny, int type, int n, const char * x, size_t bx, const char * const * y, float * out, int nrows) {
@@ -135,8 +173,22 @@ static void fill_rows(int type, char * x, size_t bx, int nrows, int n, uint64_t 
     const int nb = n/32;
     for (int r = 0; r < nrows; ++r) {
         char * row = x + r*bx;
+        if (type == T_Q6_K) {
+            for (int i = 0; i < n/256; ++i) {
+                blk_q6_K * b = (blk_q6_K *)row + i;
+                for (auto & v : b->ql) v = (uint8_t)rng();
+                for (auto & v : b->qh) v = (uint8_t)rng();
+                for (auto & v : b->scales) v = (int8_t)((int)(rng() % 255) - 127);
+                b->d = f32_to_fp16((rng() % 64 == 0) ? 2e-6f : 1e-5f*(1 + rng()%50));
+            }
+            continue;
+        }
         for (int i = 0; i < nb; ++i) {
-            if (type == 0) {
+            if (type == T_IQ4_NL) {
+                blk_iq4_nl * b = (blk_iq4_nl *)row + i;
+                b->d = f32_to_fp16((rng() % 64 == 0) ? 3e-6f*(1 + rng()%7) : 1e-4f*(1 + rng()%50));
+                for (int j = 0; j < 16; ++j) b->qs[j] = (uint8_t)rng();
+            } else if (type == T_Q8_0) {
                 blk_q8_0 * b = (blk_q8_0 *)row + i;
                 // mostly normal scales, some fp16 denormals
                 float d = (rng() % 64 == 0) ? 3e-6f*(1 + rng()%7) : 1e-4f*(1 + rng()%50);
@@ -153,11 +205,12 @@ static void fill_rows(int type, char * x, size_t bx, int nrows, int n, uint64_t 
 
 int main(int argc, char ** argv) {
     if (argc < 5) { fprintf(stderr, "usage: %s q8_0|mxfp4 ny threads_per_node nodes [MiB] [n]\n", argv[0]); return 1; }
-    const int type = strcmp(argv[1], "q8_0") == 0 ? 0 : 1;
+    const int type = !strcmp(argv[1], "q8_0") ? T_Q8_0 : !strcmp(argv[1], "mxfp4") ? T_MXFP4 :
+                     !strcmp(argv[1], "iq4_nl") ? T_IQ4_NL : T_Q6_K;
     const int ny = atoi(argv[2]), tpn = atoi(argv[3]), nnodes = atoi(argv[4]);
     const size_t mib = argc > 5 ? atol(argv[5]) : 1024;
     const int n = argc > 6 ? atoi(argv[6]) : 4096;
-    const size_t bx = type == 0 ? (size_t)(n/32)*34 : (size_t)(n/32)*17;
+    const size_t bx = row_bytes(type, n);
     const int nrows = (int)(mib*1024*1024/bx);
 
     // activations
@@ -172,8 +225,8 @@ int main(int argc, char ** argv) {
     }
 
     // correctness on a small matrix, including a tail (n not a multiple of 128)
-    for (int nt : {n, n + 96}) {
-        const size_t bxt = type == 0 ? (size_t)(nt/32)*34 : (size_t)(nt/32)*17;
+    for (int nt : {n, type == T_Q6_K ? n + 256 : n + 96}) {
+        const size_t bxt = row_bytes(type, nt);
         const int rows = 64;
         std::vector<char> xt(rows*bxt);
         fill_rows(type, xt.data(), bxt, rows, nt, 7);

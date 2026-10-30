@@ -187,6 +187,45 @@ llama-bench decode, Q8_0 dense weights (~12.7 GB/token), tmpfs on 4 KiB pages (`
     - Workaround to test: `-nkvo`, keeping the KV cache and the attention op on the CPU and only the projections on the GPU.
     - Proper fix (custom kernel, `ik_llama/fattn_sinks_patch.py`, written but not yet compiled or tested): sinks in `tile_new`'s online softmax. Seed each head's running max with its sink logit and the running sum with 1 (exp(sink − max) after rescaling).
 
+## Phase 3e: attention, small ops and the dense format (2026-10-30)
+
+All decode figures: llama-bench, 64 threads, `GGML_NUMA_BLOCKED=1 GGML_NUMA_PLACE=1 --numa distribute`, tg32 and tg32 after a 512-token prompt.
+
+**fp16 without F16C** (`ggml_f16_avx1_patch.py`, `iqk_avx1_f16c.h`):
+- SIMDe and ggml's own fallback converted fp16 one value at a time. Every K dot product and V update of the fp16 KV cache went through it, ~12 ms of a 170 ms decode step.
+- The vector versions are exact: checked on all 65536 halves and all 2^32 floats (`tools/f16c_test.cpp`).
+
+**Decode flash attention for one shared K/V head** (`ds4_fa_mqa_patch.py`, `ds4_fa_mqa_kernel.c`):
+- 64 query heads over one 512-wide fp16 K/V head. Threads take head groups × chunks of the visible rows; each row is converted once and scored against all heads of the group; f32 online softmax; chunk states merged after a barrier.
+- 15% faster than the generic loop at 512 tokens of context, and better: the generic loop accumulated V in fp16. Perplexity 3.4919 against 3.5485 (BF16 dense reference 3.4907), greedy text identical.
+- **Lazy K/V concat.** The graph builds K = V as concat(raw cache rows, compressed rows) every token, ~1 MB copied per layer at 512 tokens. When the attention node is the concat's only reader, the concat is skipped and the kernel reads the rows from its sources:
+  - CSA layers: both sources are cache views. ~1.8 ms per token saved.
+  - HCA layers: the compressed rows are one `get_rows` shared by a group of four layers. They are read in place when no node between the `get_rows` and the attention node writes into its bytes (checked at plan time). 20 × 82 µs → ~0 per token.
+  - A first attempt redirected the `get_rows` into the concat's buffer; that cannot work because one `get_rows` feeds four concats.
+
+**Small ops on one thread** (`decode_ops_patch.py`, `norm_split_patch.py`):
+- RMS norms of single 20480-float rows (the four hyper-connection streams, twice per layer): vectorised sum of squares, then split by columns across all threads with a barrier between the partial sums and the scaling. 44.5 → 11.7 µs per norm.
+- The partial sums are laid out [row][thread], eight threads to a cache line. One padded line per thread was **4× slower** (42 µs): every reader then pulls 64 lines just written on other sockets, at ~0.5 µs each.
+- `MUL_MULTI_ADD` split by token, so at batch 1 one thread did all of it (121 nodes per token, ~28 µs each); now split by columns.
+- **Negative result, split-K for the hc_pre matmul** (24 × 20480 f32, 80 per token, ~50 µs each): per-node partial sums with the last thread to arrive reducing. Slower in the model (~74 µs against 49–64 µs) and in isolation (`tools/hc_bench.c`). Cross-socket line traffic and contended atomics cost more than the split saves. An empty graph launch alone costs ~54 µs warm and ~185 µs with cold caches.
+
+**Dense format.** The dense weights (attention, shared experts, hc, Engram projections) were requantised from BF16 with `requant_shard`; experts stay MXFP4. KL divergence against BF16 dense, 16 × 256 wikitext tokens, ub 8:
+
+| Dense weights | Decode tok/s | after 512 tokens | Mean KLD | Same top token |
+|---|---|---|---|---|
+| Q8_0 (`dq8`) | 5.94 | 5.38 | 0.0139 | 97.0% |
+| **Q6_K (`dq6k`)** | 6.52 | 5.84 | 0.0178 | 96.8% |
+| IQ4_NL (`diq4`) | 7.30 | 6.50 | 0.0818 | 92.8% |
+
+- **Pick: Q6_K.** It is 10% faster than Q8_0 at a small quality cost. IQ4_NL is another 12% faster, but its KLD is 6× higher. `tools/serve.sh` defaults to `dq6k`.
+- With the attention, norm and small-op changes, dq6k decodes at **6.68 tok/s** (6.17 after a 512-token prompt). With `GGML_FA_LAZY=0`: 6.62 / 6.06.
+- The lazy concat is exact: KLD per chunk identical with it on and off (one-token batches), and 64 greedy tokens after a 694-token prompt (HCA gather active) byte-identical.
+
+Still open in Phase 3e:
+- ~4 ms per token in the hc_pre matmuls (fixed cost per small node).
+- ~2 ms in ROPE.
+- The q6_K small matmuls (`qr` 83 µs, `kv_b` 56 µs).
+
 ## Model facts (measured from the GGUF, 2026-10-29)
 
 Unsloth UD-Q8_K_XL: 474 GiB in 9 shards (SHA256 verified on the NAS), at `nas.local:/volume1/@home/richard/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-Q8_K_XL`. 40 layers, all MoE: 384 routed experts (6 active) plus 1 shared expert per layer. 4 hyper-connection streams (`embedding_length_out` 20480).
