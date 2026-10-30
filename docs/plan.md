@@ -467,6 +467,164 @@ KLD against the BF16-dense model (16 × 256 tokens of wikitext-2), decode on bui
 - Reaching dq6k quality at ~4.7 GB would need a 5-bit mix (IQ5_KS / Q5_K on the attention weights) and AVX1 kernels for those types. At most ~10 ms per token (~6%), so it stays low priority.
 - dq6k stays the pick. Each variant was a 40 s rewrite of shard 9 next to hard links of shards 1–8.
 
+## Shared expert on the GPU (2026-10-31)
+
+The shared expert (0.15 GB of Q6_K per token) is the one dense FFN piece small enough to keep on the P2200 while every layer stays on the CPU: `-ngl 0 -ot shexp=CUDA0`, build-cuda, dq6k.
+
+- ik dropped all `-ot` overrides at `-ngl 0`. The patch now keeps them when a GPU is present (`src/llama.cpp`), so single tensors can go to the GPU with no layers offloaded.
+- ggml's scheduler copies a split's inputs before running any of it, so the CPU waits for the GPU's result before starting the routed experts. `ik_llama/sched_defer_patch.py` (not applied) runs a CPU split up to the first node that needs a device result, then copies it in: the routed experts and the GPU's shared expert run side by side.
+
+| Setting | tg32 | tg32 after 512 |
+|---|---|---|
+| All on the CPU | 6.70 | 6.03 |
+| Shared expert on the GPU | 5.83 | 5.42 |
+| Shared expert on the GPU + deferred copy | 6.10 | 5.45 |
+
+- **Slower in every form.** Each CPU↔GPU hand-off inside ggml costs ~100–165 µs (set/get on `cudaStreamPerThread` plus a sync), against 15–25 µs for the same copies in a standalone CUDA test. Two hand-offs per layer add ~18 ms per token. The CPU saves only ~4.5 ms.
+- Even with zero overhead the ceiling is 3–8%, so this is closed.
+- **Draft model on the GPU** (`-draft "-ngl 99 -ot exps=CPU"`: dense draft weights on the P2200, draft experts on the CPU) computes wrong: acceptance falls from 94% to 55% on code and from 59% to 34% on prose. Some draft op differs on CUDA. Per-round time did not improve either, so it is parked.
+
+## Draft cost on the CPU (2026-10-31)
+
+Draft rounds took ~66–70 ms on build-cuda (16–19% of all time) while the draft's weight read is ~1.3 GB (~14 ms). `GGML_OP_PROF=4` (only graphs of ≤ 1000 nodes, i.e. the draft) and timers around the draft's steps showed where the time went.
+
+1. **The draft's output head was a single-node copy.** The draft borrows the target's 129k-row output head. When the two buffer types differ (on build-cuda the draft's is pinned `CUDA_Host`, the target's plain CPU), ik copies the head into one fresh allocation. NUMA placement runs before that copy, so the copy sits on one node and reads at 14.5 GB/s instead of 64–70. That cost ~30 ms per round.
+   - Fix: share the tensor whenever both buffers are in host memory (`src/llama-spec-features-dflash.cpp`). Draft compute went from 56.5 to 26.5 ms per round, and 0.5 GB of RAM is saved.
+   - build-cpu was never affected: both buffer types are plain CPU there, so the head was already shared.
+2. **The draft's confidence check ran scalar double-precision `exp` over the whole vocabulary.** With `p_min` > 0 (default 0.75) each drafted token's probability is a softmax over 129,280 logits. Only an AVX2+FMA path existed, so this CPU ran scalar `exp` at 2.4 ms per token, ~7 ms per round.
+   - Fix: an SSE2 version of the same polynomial (`common/sampling.cpp`): 0.23 ms instead of 1.84 ms, and relative error ≤ 5e-5 against the double sum.
+   - This applies to every build here, including the server's.
+
+A draft round now costs ~33 ms on build-cuda:
+
+| Step | ms |
+|---|---|
+| Graph build | 0.6 |
+| K/V update from the target's features | 2.9–3.6 |
+| Draft compute (3 blocks + output head) | 26.5 |
+| Token pick + confidence | 2.0 |
+
+Of the remaining compute, the output head is ~8 ms (0.43 GB of Q6_K at ~56 GB/s), the draft experts ~7 ms and the attention projections most of the rest. The draft is now ~8% of a round; the target's verify batch (~4 tokens at ~2.4× the cost of one) is the rest.
+
+Neither fix changes what the target outputs, and draft acceptance is unchanged. `llama-spec-bench`, build-cuda, dq6k, tok/s:
+
+| Setting | code | story |
+|---|---|---|
+| `dspark:n_max=3` before | 8.51 | 5.80 |
+| + shared output head | 9.14 | 6.27 |
+| + SSE2 confidence | 8.99–9.30 | 6.11–6.24 |
+
+Draft time per run (code, 53 rounds) went 3.64 → 2.04 → 1.77 s. Run-to-run noise is ±5%, so the second fix (~2% of a round) is too small to show in tok/s on its own.
+
+Draft length again, with the cheaper draft (tok/s):
+
+| Setting | code | story |
+|---|---|---|
+| `n_max=2` | 8.26 | 6.17 |
+| `n_max=3` | 9.30 | 6.11 |
+| `n_max=3,p_min=0.5` | 9.07 | 6.37 |
+| `n_max=3,p_min=0.9` | 9.20 | 6.11 |
+| `n_max=4` | 10.39 (stopped at 90 tokens) | 5.84 |
+| `n_max=4,p_min=0.9` | 9.89 | 6.02 |
+| `n_max=5` | 10.28 | 5.81 |
+
+The picture is the same as before: `n_max=3` is the balanced setting, and 4–5 only pays for code-like output. ik's `--spec-autotune` refuses DSpark.
+
+## The verify batch on the CPU (2026-10-31)
+
+With a draft, the target runs batches of ~4 tokens. `GGML_OP_PROF=1` on `llama-bench -p 4 -ub 4` (build-cuda, dq6k, `-ngl 0`) showed where a 4-token graph goes, against one token:
+
+| Op | batch 1 (ms) | batch 4 (ms) |
+|---|---|---|
+| Dense matmuls (Q6_K) | 62 | 101 |
+| Routed experts (MXFP4) | 16.5 | 46 |
+| f32 matmuls (hyper-connection mixes, router) | 9 | 19.5 |
+| Whole graph | 146 | 315 |
+
+At one token the Q6_K matmuls run at ~98 GB/s, close to the memory limit. At four they are compute-bound: Sandy Bridge has one port for `pmaddubsw`, `pmaddwd` and `mulps`, and the old kernel spent ~23.5 of those per 128 weights and activation row (sign/abs work for signed quants, plus a float multiply per 16 weights). The experts' growth is mostly more distinct experts being read.
+
+**New Q6_K kernel** (`iqk_avx1_gemv.h`):
+- It multiplies the unsigned quants (0..63) directly and takes the −32 offset off afterwards, as 32 × Σ scale × (sum of the 16 activations).
+- Those activation sums and the activation scales are worked out once per call, not per weight row.
+- The integer sums are the same as before, so the output is bit-identical; `mmcheck` agrees with a double-precision reference.
+
+| | before | after |
+|---|---|---|
+| `pp2` (tok/s) | 8.81 | 9.11 |
+| `pp4` (tok/s) | 11.15 | 11.89 |
+| Q6_K matmuls at batch 2 (ms/graph) | 78.9 | 69.5 |
+| Q6_K matmuls at batch 4 (ms/graph) | 101.0 | 97.0 |
+| Batch 1 | unchanged | unchanged |
+
+What is left of the kernel is close to the port's floor (~19 multiplies per 128 weights and row), so further gains there would be small.
+
+**The f32 matmuls do not get faster by cutting rows into K-pieces.** The hyper-connection mixes are 24 rows, so only 24 of 64 threads work. Cutting each row into K-pieces so that all 64 threads work made them slower: 2.8 → 3.3 ms per token at batch 1, and 6.8 → 10.4 ms at batch 4. The kernel itself is fine (19.5 GB/s on one thread from cache). As found earlier (`mm_split_k`, `mm_f32_decode`), the cost is every thread reading the activation, written by all four sockets. That patch was dropped; the K-slice below gets the split right.
+
+### Small ops that ran on a few threads
+
+A per-node trace (`GGML_OP_PROF=3`) of the batch-4 graph showed two ops that split their work by token, so 4 tokens kept 4 of 64 threads busy:
+
+- **HC_POST** (the hyper-connection output mix, 80 per graph): 15.4 ms per graph for ~1.2 ms of work. It now splits by (token, 64-element chunk), as the one-token path already did, and every element is computed as before. 15.4 → 6.1 ms. `ik_llama/hc_post_patch.py`, `GGML_HC_POST_SPLIT=0` off.
+- **The copy before `attn_wo_a`** (`dup_bytes`, permuted attention output, 512 KB at 4 tokens) split by dim-1 rows only. It now splits all rows when there are fewer dim-1 rows than threads. CONT 8.5 → 3.4 ms. `ik_llama/dup_rows_patch.py`.
+
+`llama-bench`, `GGML_HC_POST_SPLIT` 0 vs 1 (two runs each, tok/s):
+
+| | off | on |
+|---|---|---|
+| `pp2` | 8.75 / 8.33 | 9.27 / 9.06 |
+| `pp4` | 10.87 / 11.67 | 12.38 / 12.24 |
+
+### K-slice for the hyper-connection mixes
+
+With a few tokens the RMS norm before each mix is split along K (`norm_split_patch.py`): thread *i* writes slice *i* of every row. So the mix now splits the same way. Thread *i* multiplies its own K-slice of all 24 weight rows by the activation slice it just wrote, puts partial sums in the work buffer, and after a barrier each thread adds up a share of the outputs in thread order. Nothing is read from another socket except the small partial-sum buffer.
+
+At first this made one token slower, because 3/4 of each thread's weight slice sat on other nodes (rows were placed by row quarters). These weights (f32, < 64 rows, ≥ 4096 columns) are now placed by column quarters instead.
+
+`ik_llama/kslice_patch.py`, `GGML_MUL_MAT_KSLICE=0` off. `mmcheck` (`MMCHECK_F32=1`) shows errors of ~4e-9 against the double-precision reference, lower than the row split's.
+
+| | off | on |
+|---|---|---|
+| f32 matmuls, batch 4 (ms/graph) | 21.7 | 10.6 |
+| `pp2` (tok/s) | 9.37 / 9.29 | 9.58 / 9.69 |
+| `pp4` (tok/s) | 12.53 / 12.46 | 12.87 / 12.92 |
+| `tg16` (tok/s) | 6.70 / 6.49 | 6.74 / 6.74 |
+
+The batch-4 graph went 315 → 294 ms over this section.
+
+**The K-slice changes the summation order, so greedy output can differ.** KL divergence against BF16 (dq6k, `kld1.sh`, same build, 16 chunks):
+
+| | off | on |
+|---|---|---|
+| Mean KLD | 0.0170 ± 0.0012 | 0.0188 ± 0.0014 |
+| 99th percentile KLD | 0.268 | 0.297 |
+| Same top token | 97.10 ± 0.37% | 96.90 ± 0.39% |
+| PPL(Q)/PPL(BF16) | 1.0207 ± 0.0068 | 1.0075 ± 0.0062 |
+
+These are level within the error, so the K-slice stays on.
+
+Spec-bench (build-cuda, dq6k, DSpark, tok/s, two runs each):
+
+| Stage | `n_max=3` code | `n_max=3` story | `n_max=4` code | `n_max=4` story |
+|---|---|---|---|---|
+| Before the Q6_K kernel | 8.99–9.30 | 6.11–6.24 | | |
+| + Q6_K kernel | 9.29 / 9.52 | 6.16 / 6.58 | 10.22 / 10.64 | 5.78 / 5.99 |
+| + HC_POST and copy splits | 9.62 / 9.67 | 6.73 / 6.75 | 10.43 / 10.45 | 6.06 / 6.00 |
+| + K-slice | 9.69 / 9.59 | 6.28 / 6.24 | 10.96 / 10.92 | 6.00 |
+| + chunk-major HC_POST (same output) | 9.65 / 9.72 | 6.32 / 6.36 | 10.20 / 10.99 (stops at 90 tokens) | 5.95 / 5.95 |
+
+With the K-slice the story run takes a different greedy path (83 of 167 drafted tokens accepted instead of 96 of 162), so its tok/s is not comparable to the row above. It shows how much prose speed depends on the text.
+
+`llama-bench` with all of the above (no draft): `pp1` 6.96, `pp2` 10.29, `pp3` 11.92, `pp4` 12.68, `pp5` 13.55, `tg16` 6.69 tok/s.
+
+What is left at batch 4 (~290 ms per graph):
+- Q6_K matmuls 97 ms, at the multiply port's floor.
+- Routed experts 88 + 46 ms, set by how many distinct experts the 4 tokens pick.
+- Shared expert 14 ms.
+- The f32 router (`ffn_gate_inp`, 384 rows, ~6 ms).
+- HC_POST 6 ms, RMS norms 5 ms.
+
+**HC_POST order.** Token-major tasks give thread *i* a few whole tokens, so it reads columns that 64 other threads wrote in the matmul before. Chunk-major tasks (now the default; `GGML_HC_POST_SPLIT=1` for token-major) give it the same 64 columns of every token, which is exactly what its share of that matmul wrote. Output is bit-identical. HC_POST itself did not get faster (6.1 vs 6.5 ms), but the op that next reads its output, MUL_MULTI_ADD, went 3.4 → 2.1 ms (per-thread average 2.85 → 1.05), and the batch-4 graph went 289.8 → 286.9 ms. `pp4` was 13.08 / 12.80 vs 13.07 / 13.11 tok/s, within the noise.
+
 ## Ideas for cutting the per-token weight read (2026-10-30)
 
 At dq6k each token reads ~10.9 GB: experts 4.5, dense 6.1, f32 router/hc 0.3. That is ~98 ms at 110 GB/s. They are listed best first.

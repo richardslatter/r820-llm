@@ -46,6 +46,9 @@ This is a working log, not a polished project. The plan and all measurements are
 | Long context, threads, prompt speed | done: −14% decode at 16K context; 64 threads best; prompts 10.8 tok/s, compute-bound at 60–70% of AVX1 peak |
 | Imatrix 4-bit dense, 4-bit output head | done: KLD 0.082 → 0.078 (within error), no speed gain; dq6k stays the pick |
 | GPU retest with current kernels | done: layer offload now slows decode; `-ngl 0` on build-cuda gives prompts +40–47% for −2–5% decode; 672 W peak |
+| Shared expert on the GPU | closed: slower in every form (6.70 → 5.83 tok/s); each CPU↔GPU hand-off costs 100–165 µs |
+| Draft cost on the CPU | done: draft round 66–70 → ~33 ms (shared output head, SSE2 softmax); `dspark:n_max=3` code 8.51 → 9.1–9.3 tok/s |
+| Verify batch on the CPU (Q6_K kernel, HC_POST/copy splits, f32 K-slice) | done: `pp4` 11.15 → 12.9 tok/s, batch-4 graph 315 → 294 ms; `dspark` code **9.6–9.7** (`n_max=3`), **10.9** (`n_max=4`), prose 6.2–6.7 |
 
 First runs (60 threads, stock placement, Q8_0 dense):
 - ik_llama.cpp: **2.31 tok/s** decode, 5.3 tok/s prompt.
@@ -77,8 +80,8 @@ Estimate: ~6.5 tok/s NUMA-local on the CPU; ~12 with the dense part on the GPU a
 | `tools/placecheck.py` | Reports which node each weight's row quarters actually sit on (move_pages) |
 | `tools/splitpages.py` | Splits tmpfs huge pages to 4 KiB in place (pid/address debugfs form) |
 | `tools/rd2.c`, `tools/rdfile.c`, `tools/clearpol.c` | Bandwidth tests (4 KiB vs 2 MB pages, tmpfs files), policy reset |
-| `ik_llama/iqk_avx1_gemv.h`, `ik_llama/avx1_gemv_patch.py` | Native 128-bit Q8_0 and MXFP4 matrix × small-batch kernels for Sandy Bridge, hooked into iqk for 1–8 rows (`GGML_AVX1_GEMV=0` turns them off) |
-| `ik_llama/numa_barrier_patch.py` | Two-level NUMA barrier for `GGML_NUMA_BLOCKED` (`GGML_HBARRIER=0` off) and the `GGML_OP_PROF=1` per-op / per-weight profiler |
+| `ik_llama/iqk_avx1_gemv.h`, `ik_llama/avx1_gemv_patch.py` | Native 128-bit Q8_0, Q6_K, IQ4_NL and MXFP4 matrix × small-batch kernels for Sandy Bridge, hooked into iqk for 1–8 rows (`GGML_AVX1_GEMV=0` turns them off) |
+| `ik_llama/numa_barrier_patch.py` | Two-level NUMA barrier for `GGML_NUMA_BLOCKED` (`GGML_HBARRIER=0` off) and the `GGML_OP_PROF=1` per-op / per-weight profiler (`=2` decode-sized graphs only, `=4` graphs of ≤ 1000 nodes such as a draft model's) |
 | `ik_llama/small_split_patch.py` | Even row split for matmuls with < 32 rows per thread at small batch |
 | `ik_llama/grouped_split_patch.py` | NUMA-local split for grouped matmuls on a reshaped 2D weight (wo_a) |
 | `tools/gemv_bench.cpp` | Correctness and per-node bandwidth test for the AVX1 kernels |
@@ -91,6 +94,9 @@ Estimate: ~6.5 tok/s NUMA-local on the CPU; ~12 with the dense part on the GPU a
 | `tools/mm_bench.c` | Decode matmuls (one activation row) of any type in isolation, NUMA-placed, on 4 KB pages |
 | `ik_llama/ser_patch.py` | Re-enables `-ser`: top-k selection, threshold on the unbiased weights, zero-weight slots skipped |
 | `ik_llama/mm_localq_patch.py`, `ik_llama/mm_f32_decode_patch.py` | Negative results, kept for reference: per-thread activation quantisation, node-local f32 activation copy |
+| `ik_llama/sched_defer_patch.py` | Negative result, not in `r820.patch`: lets a CPU split start before the GPU results it needs later are copied in (`GGML_SCHED_DEFER=0` off) |
+| `ik_llama/hc_post_patch.py`, `ik_llama/dup_rows_patch.py` | HC_POST and same-type copies split over all threads when there are only a few tokens (`GGML_HC_POST_SPLIT=0` off) |
+| `ik_llama/kslice_patch.py` | Few-row f32 matmuls (hyper-connection mixes) split along the norm's K-slices, weights placed by column quarters (`GGML_MUL_MAT_KSLICE=0` off) |
 | `tools/f16c_test.cpp` | Exhaustive check of the fp16 conversions |
 | `tools/serve.sh`, `tools/v4_chat.jinja` | LAN chat server (llama-server, web UI on :8080) and a plain chat template it can parse |
 | `tools/mmcheck.c` | ggml `mul_mat` / `mul_mat_id` checker against a double-precision reference |
@@ -151,4 +157,5 @@ python3 tools/gguf_tensors.py model-*.gguf > tensors.tsv
 gcc -O2 -march=native -I$IK/ggml/include tools/mmcheck.c -o mmcheck -L$IK/build-cpu/ggml/src -lggml -lm -Wl,-rpath,$IK/build-cpu/ggml/src
 ./mmcheck 64                    # all types, mul_mat and mul_mat_id
 MMCHECK_NUMA=1 GGML_NUMA_BLOCKED=1 ./mmcheck 64   # static NUMA expert split
+MMCHECK_F32=1 GGML_NUMA_BLOCKED=1 ./mmcheck 64    # few-row f32 matmuls (K-slice)
 ```

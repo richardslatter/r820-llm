@@ -251,24 +251,48 @@ static void gemv_iq4_nl(int n, const void * vx, size_t bx, const Rows<ny> & rows
 //
 // Q6_K weights: 256-weight superblocks, fp16 scale, 16 int8 sub-block scales (one per 16
 // weights), 6-bit quants split into low nibbles (ql) and 2-bit high parts (qh). Each 128-weight
-// half of a superblock lines up with one Q8_2_X4 group. Quants are made signed (q - 32) and
-// pmaddwd applies the sub-block scale while it adds the pairs.
+// half of a superblock lines up with one Q8_2_X4 group. pmaddubsw multiplies the unsigned quants
+// (0..63) with the activations and pmaddwd applies the sub-block scale while it adds the pairs;
+// the -32 offset comes off afterwards as 32 * sum_j scale_j * (sum of the 16 activations of j).
+// Those activation sums and the fp32 activation scales are worked out once per call, so each
+// further activation row costs two multiplies per 16 weights and no sign or abs work.
+// The integer sums are the same as with signed quants, so the results are too.
 //
 struct blk_q6_K { uint8_t ql[128]; uint8_t qh[64]; int8_t scales[16]; uint16_t d; };
 static_assert(sizeof(blk_q6_K) == 210, "q6_K");
 
-// pairs of int16 products of 16 signed 6-bit quants with 16 int8 activations, times one scale
-static inline __m128i dot16_scaled(__m128i x, const int8_t * y, __m128i scale16) {
-    const __m128i yv = _mm_loadu_si128((const __m128i *)y);
-    return _mm_madd_epi16(_mm_maddubs_epi16(_mm_abs_epi8(x), _mm_sign_epi8(yv, x)), scale16);
-}
+// per Q8_2_X4 group of one activation row: sums of its 8 runs of 16 quants and its 4 scales
+struct q6_K_ygroup { __m128i ysum; __m128 d; };
 
 template <int ny, typename Store>
 static void gemv_q6_K(int n, const void * vx, size_t bx, const Rows<ny> & rows, int nrc_x, Store && store) {
     const int nsb = n / 256;
+    const int ng  = 2*nsb;
     const __m128i m4  = _mm_set1_epi8(0x0f);
     const __m128i m30 = _mm_set1_epi8(0x30);
-    const __m128i m32 = _mm_set1_epi8(32);
+    q6_K_ygroup * yg = (q6_K_ygroup *)__builtin_alloca(sizeof(q6_K_ygroup)*ny*ng + 16);
+    yg = (q6_K_ygroup *)(((uintptr_t)yg + 15) & ~(uintptr_t)15);
+    {
+        const __m128i bias = _mm_set1_epi8((char)0x80), zero = _mm_setzero_si128();
+        for (int iy = 0; iy < ny; ++iy) {
+            for (int g = 0; g < ng; ++g) {
+                const blk_q8_2_x4 * yb = (const blk_q8_2_x4 *)rows.y[iy] + g;
+                // psadbw against 0 sums 8 bytes; the bias makes them unsigned, 16*128 comes off after
+                __m128i t[4];
+                for (int k = 0; k < 4; ++k) {
+                    const __m128i s0 = _mm_sad_epu8(_mm_xor_si128(_mm_loadu_si128((const __m128i *)(yb->qs + 32*k)), bias), zero);
+                    const __m128i s1 = _mm_sad_epu8(_mm_xor_si128(_mm_loadu_si128((const __m128i *)(yb->qs + 32*k + 16)), bias), zero);
+                    // [sum of run 2k, sum of run 2k+1] in the low 32 bits of each 64-bit lane
+                    t[k] = _mm_add_epi32(_mm_unpacklo_epi64(s0, s1), _mm_unpackhi_epi64(s0, s1));
+                }
+                const __m128i t03 = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(t[0]), _mm_castsi128_ps(t[1]), 0x88));
+                const __m128i t47 = _mm_castps_si128(_mm_shuffle_ps(_mm_castsi128_ps(t[2]), _mm_castsi128_ps(t[3]), 0x88));
+                q6_K_ygroup & o = yg[iy*ng + g];
+                o.ysum = _mm_sub_epi16(_mm_packs_epi32(t03, t47), _mm_set1_epi16(16*128));
+                o.d    = bf16x4_to_f32(yb->d);
+            }
+        }
+    }
     for (int ix = 0; ix < nrc_x; ++ix) {
         const blk_q6_K * x = (const blk_q6_K *)((const char *)vx + ix*bx);
         __m128 acc[ny];
@@ -283,37 +307,46 @@ static void gemv_q6_K(int n, const void * vx, size_t bx, const Rows<ny> & rows, 
                 const uint8_t * ql = xb->ql + 64*half;
                 const uint8_t * qh = xb->qh + 32*half;
                 const __m128i scs = half ? sc_hi : sc_lo;  // scales of this half, 8 x int16
+                const __m128i scs32 = _mm_slli_epi16(scs, 5); // 32 * scale fits in int16
                 const __m128i l0 = _mm_loadu_si128((const __m128i *)(ql +  0));
                 const __m128i l1 = _mm_loadu_si128((const __m128i *)(ql + 16));
                 const __m128i l2 = _mm_loadu_si128((const __m128i *)(ql + 32));
                 const __m128i l3 = _mm_loadu_si128((const __m128i *)(ql + 48));
                 const __m128i h0 = _mm_loadu_si128((const __m128i *)(qh +  0));
                 const __m128i h1 = _mm_loadu_si128((const __m128i *)(qh + 16));
-                // the four 32-weight blocks of this half, as signed values, 2 x 16 each
+                // the eight 16-weight sub-blocks of this half, as unsigned 0..63
                 __m128i xq[8];
-                xq[0] = _mm_sub_epi8(_mm_or_si128(_mm_and_si128(l0, m4), _mm_and_si128(_mm_slli_epi16(h0, 4), m30)), m32);
-                xq[1] = _mm_sub_epi8(_mm_or_si128(_mm_and_si128(l1, m4), _mm_and_si128(_mm_slli_epi16(h1, 4), m30)), m32);
-                xq[2] = _mm_sub_epi8(_mm_or_si128(_mm_and_si128(l2, m4), _mm_and_si128(_mm_slli_epi16(h0, 2), m30)), m32);
-                xq[3] = _mm_sub_epi8(_mm_or_si128(_mm_and_si128(l3, m4), _mm_and_si128(_mm_slli_epi16(h1, 2), m30)), m32);
-                xq[4] = _mm_sub_epi8(_mm_or_si128(_mm_and_si128(_mm_srli_epi16(l0, 4), m4), _mm_and_si128(h0, m30)), m32);
-                xq[5] = _mm_sub_epi8(_mm_or_si128(_mm_and_si128(_mm_srli_epi16(l1, 4), m4), _mm_and_si128(h1, m30)), m32);
-                xq[6] = _mm_sub_epi8(_mm_or_si128(_mm_and_si128(_mm_srli_epi16(l2, 4), m4), _mm_and_si128(_mm_srli_epi16(h0, 2), m30)), m32);
-                xq[7] = _mm_sub_epi8(_mm_or_si128(_mm_and_si128(_mm_srli_epi16(l3, 4), m4), _mm_and_si128(_mm_srli_epi16(h1, 2), m30)), m32);
+                xq[0] = _mm_or_si128(_mm_and_si128(l0, m4), _mm_and_si128(_mm_slli_epi16(h0, 4), m30));
+                xq[1] = _mm_or_si128(_mm_and_si128(l1, m4), _mm_and_si128(_mm_slli_epi16(h1, 4), m30));
+                xq[2] = _mm_or_si128(_mm_and_si128(l2, m4), _mm_and_si128(_mm_slli_epi16(h0, 2), m30));
+                xq[3] = _mm_or_si128(_mm_and_si128(l3, m4), _mm_and_si128(_mm_slli_epi16(h1, 2), m30));
+                xq[4] = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(l0, 4), m4), _mm_and_si128(h0, m30));
+                xq[5] = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(l1, 4), m4), _mm_and_si128(h1, m30));
+                xq[6] = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(l2, 4), m4), _mm_and_si128(_mm_srli_epi16(h0, 2), m30));
+                xq[7] = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(l3, 4), m4), _mm_and_si128(_mm_srli_epi16(h1, 2), m30));
                 // scale of 16-weight sub-block j (0..7 in this half), broadcast to 8 x int16
                 __m128i s16[8];
                 for (int j = 0; j < 8; ++j) {
                     s16[j] = _mm_shuffle_epi8(scs, _mm_set1_epi16((short)(0x0100 + 0x0202*j)));
                 }
                 const int g = 2*ib + half;
+                // integer sums of all rows first, then the float work, so the multiplies of the
+                // next row are not queued behind the conversion and scaling of the previous one
+                __m128i sum[ny];
                 for (int iy = 0; iy < ny; ++iy) {
-                    const blk_q8_2_x4 * yb = (const blk_q8_2_x4 *)rows.y[iy] + g;
+                    const int8_t * yq = ((const blk_q8_2_x4 *)rows.y[iy] + g)->qs;
                     __m128i p[4];
                     for (int k = 0; k < 4; ++k) {
-                        p[k] = _mm_add_epi32(dot16_scaled(xq[2*k + 0], yb->qs + 32*k,      s16[2*k + 0]),
-                                             dot16_scaled(xq[2*k + 1], yb->qs + 32*k + 16, s16[2*k + 1]));
+                        const __m128i y0 = _mm_loadu_si128((const __m128i *)(yq + 32*k));
+                        const __m128i y1 = _mm_loadu_si128((const __m128i *)(yq + 32*k + 16));
+                        p[k] = _mm_add_epi32(_mm_madd_epi16(_mm_maddubs_epi16(xq[2*k + 0], y0), s16[2*k + 0]),
+                                             _mm_madd_epi16(_mm_maddubs_epi16(xq[2*k + 1], y1), s16[2*k + 1]));
                     }
-                    const __m128 d = _mm_mul_ps(dx, bf16x4_to_f32(yb->d));
-                    acc[iy] = _mm_add_ps(acc[iy], _mm_mul_ps(d, _mm_cvtepi32_ps(sum4_epi32(p[0], p[1], p[2], p[3]))));
+                    // per 32-block: sum of scale * unsigned quant * y, less 32 * sum of scale * run sum
+                    sum[iy] = _mm_sub_epi32(sum4_epi32(p[0], p[1], p[2], p[3]), _mm_madd_epi16(scs32, yg[iy*ng + g].ysum));
+                }
+                for (int iy = 0; iy < ny; ++iy) {
+                    acc[iy] = _mm_add_ps(acc[iy], _mm_mul_ps(_mm_mul_ps(dx, yg[iy*ng + g].d), _mm_cvtepi32_ps(sum[iy])));
                 }
             }
         }

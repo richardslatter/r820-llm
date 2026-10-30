@@ -55,8 +55,10 @@ int main(int argc, char ** argv) {
     srand(1);
     for (int i = 0; i < K*R; ++i) src[i] = (rand()/(float)RAND_MAX - 0.5f)*0.01f;
 
-    struct ggml_tensor * x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, K);
-    for (int i = 0; i < K; ++i) ((float *) x->data)[i] = rand()/(float)RAND_MAX - 0.5f;
+    // MM_NY activation rows (default 1)
+    const int ny = getenv("MM_NY") ? atoi(getenv("MM_NY")) : 1;
+    struct ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, ny);
+    for (int i = 0; i < K*ny; ++i) ((float *) x->data)[i] = rand()/(float)RAND_MAX - 0.5f;
 
     struct ggml_cgraph * gf = ggml_new_graph_custom(ctx, 4*L + 16, false);
     size_t placed = 0;
@@ -68,7 +70,8 @@ int main(int argc, char ** argv) {
             ggml_quantize_chunk(type, src, w->data, 0, R, K, NULL, NULL);
         }
         if (place) placed += ggml_numa_place_tensor(w);
-        ggml_build_forward_expand(gf, ggml_mul_mat(ctx, w, x));
+        // MM_NORM=1: an rms_norm writes the activation just before each matmul, as in the model
+        ggml_build_forward_expand(gf, ggml_mul_mat(ctx, w, getenv("MM_NORM") ? ggml_rms_norm(ctx, x, 1e-6f) : x));
     }
 
     struct ggml_cplan plan = ggml_graph_plan(gf, nth);

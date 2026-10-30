@@ -36,7 +36,8 @@ static double check(enum ggml_type type, int K, int N, int M, int nth) {
     ggml_type_traits_t tt = ggml_internal_get_type_traits(type);
     float * wd = malloc(sizeof(float) * K * N);
     for (int r = 0; r < N; ++r) {
-        tt.to_float((const char *)a->data + r * a->nb[1], wd + (size_t)r * K, K);
+        if (type == GGML_TYPE_F32) memcpy(wd + (size_t)r * K, (const char *)a->data + r * a->nb[1], sizeof(float) * K);
+        else tt.to_float((const char *)a->data + r * a->nb[1], wd + (size_t)r * K, K);
     }
 
     double worst = 0;
@@ -113,6 +114,21 @@ static double check_id(enum ggml_type type, int K, int N, int E, int U, int T, i
 
 int main(int argc, char ** argv) {
     int nth = argc > 1 ? atoi(argv[1]) : 4;
+    if (getenv("MMCHECK_F32")) {
+        // few long f32 rows, as DeepSeek V4's hyper-connection mixes (24 x 16384), and a 256-row router
+        const int shapes[][2] = { { 16384, 24 }, { 16384, 3 }, { 4096, 256 }, { 1000, 24 } };
+        const int ms[] = { 1, 2, 4, 8, 9 };
+        for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); ++i) {
+            printf("f32 K=%-6d N=%-4d", shapes[i][0], shapes[i][1]);
+            for (size_t j = 0; j < sizeof(ms) / sizeof(ms[0]); ++j) {
+                double e = check(GGML_TYPE_F32, shapes[i][0], shapes[i][1], ms[j], nth);
+                printf("   M=%-2d %-9.2e%s", ms[j], e, e > 1e-5 ? "!" : " ");
+            }
+            printf("\n");
+            fflush(stdout);
+        }
+        return 0;
+    }
     if (getenv("MMCHECK_NUMA")) {
         // exercise the GGML_NUMA_BLOCKED static expert split: it needs chunks_per_expert =
         // min(nth, rows/32) divisible by the node count, so use full-size expert rows
