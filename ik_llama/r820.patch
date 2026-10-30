@@ -202,7 +202,7 @@ index 1e266581..e2c0b072 100644
  void dequantize_row_q6_0(const block_q6_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
  
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 368bc5e5..02b34ee1 100644
+index 368bc5e5..8e699b6c 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -38,6 +38,11 @@
@@ -639,7 +639,15 @@ index 368bc5e5..02b34ee1 100644
      if (g_state.numa.n_nodes > 0) {
          fprintf(stderr, "ggml_numa_init: NUMA already initialized\n");
  
-@@ -16228,10 +16320,16 @@ static void ggml_compute_forward_concat_any(
+@@ -11036,6 +11128,7 @@ struct ggml_tensor * ggml_top_k_thresh(
+         result = ggml_argsort(ctx, a, GGML_SORT_ORDER_DESC);
+     } else {
+         result = ggml_argsort_thresh(ctx, a, min_entries, thresh);
++        ggml_set_op_params_i32(result, 2, k); // only the first k entries are read
+     }
+ 
+     result = ggml_view_4d(ctx, result,
+@@ -16228,10 +16321,16 @@ static void ggml_compute_forward_concat_any(
      }
  }
  
@@ -656,7 +664,7 @@ index 368bc5e5..02b34ee1 100644
      const struct ggml_tensor * src0 = dst->src[0];
  
      switch (src0->type) {
-@@ -17914,6 +18012,91 @@ static void ggml_compute_forward_fused_norm(
+@@ -17914,6 +18013,91 @@ static void ggml_compute_forward_fused_norm(
  
  // ggml_compute_forward_group_rms_norm
  
@@ -748,7 +756,7 @@ index 368bc5e5..02b34ee1 100644
  static void ggml_compute_forward_rms_norm_f32(
          const struct ggml_compute_params * params,
          struct ggml_tensor * dst) {
-@@ -17934,6 +18117,14 @@ static void ggml_compute_forward_rms_norm_f32(
+@@ -17934,6 +18118,14 @@ static void ggml_compute_forward_rms_norm_f32(
  
      GGML_ASSERT(eps > 0.0f);
  
@@ -763,7 +771,7 @@ index 368bc5e5..02b34ee1 100644
      // TODO: optimize
      const int64_t nr = ne01*ne02*ne03;
      for (int64_t ir = ith; ir < nr; ir += nth) {
-@@ -17943,10 +18134,7 @@ static void ggml_compute_forward_rms_norm_f32(
+@@ -17943,10 +18135,7 @@ static void ggml_compute_forward_rms_norm_f32(
  
          const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
  
@@ -775,7 +783,7 @@ index 368bc5e5..02b34ee1 100644
  
          const float mean = sum/ne00;
  
-@@ -18037,6 +18225,14 @@ static void ggml_compute_forward_fused_rms_norm_f32(
+@@ -18037,6 +18226,14 @@ static void ggml_compute_forward_fused_rms_norm_f32(
          return;
      }
  
@@ -790,7 +798,7 @@ index 368bc5e5..02b34ee1 100644
      int nrows = ne03*ne02*ne01;
      int nrows_per_thread = (nrows + nth - 1)/nth;
      int first = ith*nrows_per_thread;
-@@ -18051,10 +18247,7 @@ static void ggml_compute_forward_fused_rms_norm_f32(
+@@ -18051,10 +18248,7 @@ static void ggml_compute_forward_fused_rms_norm_f32(
          const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
                float * y = (float *) ((char *) dst->data +  i01*nb1  + i02*nb2  + i03*nb3);
  
@@ -802,7 +810,7 @@ index 368bc5e5..02b34ee1 100644
          const float mean = sum/ne00;
          const float scale = 1.0f/sqrtf(mean + eps);
          for (int j = 0; j < (int)ne00; ++j) {
-@@ -18819,6 +19012,28 @@ static void ggml_compute_forward_mul_mat_id(
+@@ -18819,6 +19013,28 @@ static void ggml_compute_forward_mul_mat_id(
              if (matrix_row_counts[a] > 0) total_chunks += chunks_per_expert;
          }
  
@@ -831,7 +839,7 @@ index 368bc5e5..02b34ee1 100644
          int chunk_id = ith;
          while (chunk_id < total_chunks) {
              // Map global chunk_id to (expert_index, local_chunk_index)
-@@ -19156,6 +19371,42 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
+@@ -19156,6 +19372,42 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
          if (matrix_row_counts[a] > 0) total_chunks_ug += chunks_per_expert_ug;
      }
  
@@ -874,7 +882,7 @@ index 368bc5e5..02b34ee1 100644
      int last_a = 0;
      int last_acc = 0;
      int chunk_id_ug = ith;
-@@ -20477,6 +20728,7 @@ static void ggml_compute_forward_get_rows(
+@@ -20477,6 +20729,7 @@ static void ggml_compute_forward_get_rows(
          case GGML_TYPE_Q6_0_R4:
          case GGML_TYPE_I2_S:
          case GGML_TYPE_Q8_0_R8:
@@ -882,7 +890,46 @@ index 368bc5e5..02b34ee1 100644
          case GGML_TYPE_MXFP4:
          case GGML_TYPE_MXFP4_R8:
          case GGML_TYPE_IQ4_XS:
-@@ -23514,6 +23766,427 @@ static void ggml_compute_forward_grouped_topk(
+@@ -23447,10 +23700,38 @@ static void ggml_compute_forward_argsort_thresh_f32(
+ 
+     //if (ith == 0) printf("%s: min_entries = %d, thresh = %g\n", __func__, min_entries, (double)thresh);
+ 
++    const int k = ggml_get_op_params_i32(dst, 2);
++
+     for (int64_t i = ith; i < nr; i += nth) {
+         int32_t * dst_data = (int32_t *)((char *) dst->data + i*nb1);
+         const float * src_data = (float *)((char *) src0->data + i*nb01);
+ 
++        if (k > 0 && k < ne0) {
++            // the k largest by insertion, then reordered and thresholded by the weights in src[1]
++            // (the unbiased expert weights) when given
++            const float * ref = dst->src[1] ? (const float *)((const char *) dst->src[1]->data + i*dst->src[1]->nb[1]) : src_data;
++            int n = 0;
++            for (int32_t e = 0; e < (int32_t) ne0; ++e) {
++                const float v = src_data[e];
++                if (n == k && v <= src_data[dst_data[k - 1]]) continue;
++                int j = n < k ? n++ : k - 1;
++                for (; j > 0 && src_data[dst_data[j - 1]] < v; --j) dst_data[j] = dst_data[j - 1];
++                dst_data[j] = e;
++            }
++            for (int j = 1; j < k; ++j) {
++                const int32_t e = dst_data[j];
++                int jj = j;
++                for (; jj > 0 && ref[dst_data[jj - 1]] < ref[e]; --jj) dst_data[jj] = dst_data[jj - 1];
++                dst_data[jj] = e;
++            }
++            const float max_value = ref[dst_data[0]];
++            for (int j = min_entries; j < k; ++j) {
++                if (ref[dst_data[j]] < max_value*thresh) dst_data[j] = -1;
++            }
++            for (int64_t j = k; j < ne0; ++j) dst_data[j] = -1;
++            continue;
++        }
++
+         for (int64_t j = 0; j < ne0; j++) {
+             dst_data[j] = j;
+         }
+@@ -23514,6 +23795,427 @@ static void ggml_compute_forward_grouped_topk(
  
  // ggml_compute_forward_flash_attn_ext
  
@@ -1310,7 +1357,7 @@ index 368bc5e5..02b34ee1 100644
  static void ggml_compute_forward_flash_attn_ext_f16(
          const struct ggml_compute_params * params,
          struct ggml_tensor * dst) {
-@@ -23533,6 +24206,10 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+@@ -23533,6 +24235,10 @@ static void ggml_compute_forward_flash_attn_ext_f16(
      GGML_TENSOR_LOCALS(int64_t, ne,  dst, ne)
      GGML_TENSOR_LOCALS(size_t,  nb,  dst, nb)
  
@@ -1321,7 +1368,7 @@ index 368bc5e5..02b34ee1 100644
      const int ith = params->ith;
      const int nth = params->nth;
  
-@@ -29188,7 +29865,7 @@ typedef int ggml_lock_t;
+@@ -29188,7 +29894,7 @@ typedef int ggml_lock_t;
  
  // Android's libc implementation "bionic" does not support setting affinity
  #if defined(__gnu_linux__)
@@ -1330,7 +1377,7 @@ index 368bc5e5..02b34ee1 100644
      if (!ggml_is_numa()) {
          return;
      }
-@@ -29200,7 +29877,8 @@ static void set_numa_thread_affinity(int thread_n) {
+@@ -29200,7 +29906,8 @@ static void set_numa_thread_affinity(int thread_n) {
      switch(g_state.numa.numa_strategy) {
          case GGML_NUMA_STRATEGY_DISTRIBUTE:
              // run thread on node_num thread_n / (threads per node)
@@ -1340,7 +1387,7 @@ index 368bc5e5..02b34ee1 100644
              break;
          case GGML_NUMA_STRATEGY_ISOLATE:
              // run thread on current_node
-@@ -29221,8 +29899,15 @@ static void set_numa_thread_affinity(int thread_n) {
+@@ -29221,8 +29928,15 @@ static void set_numa_thread_affinity(int thread_n) {
  
      cpu_set_t * cpus = CPU_ALLOC(g_state.numa.total_cpus);
      CPU_ZERO_S(setsize, cpus);
@@ -1358,7 +1405,7 @@ index 368bc5e5..02b34ee1 100644
      }
  
      rv = pthread_setaffinity_np(pthread_self(), setsize, cpus);
-@@ -29233,6 +29918,38 @@ static void set_numa_thread_affinity(int thread_n) {
+@@ -29233,6 +29947,38 @@ static void set_numa_thread_affinity(int thread_n) {
      CPU_FREE(cpus);
  }
  
@@ -1397,7 +1444,7 @@ index 368bc5e5..02b34ee1 100644
  static void clear_numa_thread_affinity(void) {
      if (!ggml_is_numa()) {
          return;
-@@ -29286,7 +30003,8 @@ static void set_cpu_thread_affinity(const struct ggml_cplan * cplan, int thread_
+@@ -29286,7 +30032,8 @@ static void set_cpu_thread_affinity(const struct ggml_cplan * cplan, int thread_
  #else
  // TODO: Windows etc.
  // (the linux implementation may also work on BSD, someone should test)
@@ -1407,7 +1454,7 @@ index 368bc5e5..02b34ee1 100644
  static void clear_numa_thread_affinity(void) {}
  static void set_cpu_thread_affinity(const struct ggml_cplan * cplan, int thread_n) { UNUSED(cplan); UNUSED(thread_n); }
  #endif
-@@ -29563,6 +30281,8 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
+@@ -29563,6 +30310,8 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
  
      int max_tasks = 1;
  
@@ -1416,7 +1463,7 @@ index 368bc5e5..02b34ee1 100644
      // thread scheduling for the different operations + work buffer size estimation
      for (int i = 0; i < cgraph->n_nodes; i++) {
          struct ggml_tensor * node = cgraph->nodes[i];
-@@ -29716,6 +30436,7 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
+@@ -29716,6 +30465,7 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
                      size_t size = iqk_fa_work_buffer_size(node, n_tasks);
                      cur = MAX(cur, size);
  #endif
@@ -1424,7 +1471,7 @@ index 368bc5e5..02b34ee1 100644
                  } break;
              case GGML_OP_LATENT_ATTN:
                  {
-@@ -29766,6 +30487,11 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
+@@ -29766,6 +30516,11 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
                  {
                      cur = ggml_type_size(node->type)*(n_tasks + node->src[0]->ne[0]*n_tasks);
                  } break;
@@ -1436,7 +1483,7 @@ index 368bc5e5..02b34ee1 100644
              case GGML_OP_COUNT:
                  {
                      GGML_ABORT("fatal error");
-@@ -29788,14 +30514,97 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
+@@ -29788,14 +30543,97 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
      return cplan;
  }
  
@@ -1535,7 +1582,7 @@ index 368bc5e5..02b34ee1 100644
  
      struct ggml_compute_params params = {
          /*.ith   =*/ state->ith,
-@@ -29818,7 +30627,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -29818,7 +30656,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
  #if IK_PRINT_TIMING
          int64_t tim1 = ggml_time_us();
  #endif
@@ -1545,7 +1592,7 @@ index 368bc5e5..02b34ee1 100644
  #if IK_PRINT_TIMING
          int64_t tim2 = ggml_time_us();
          t_eval += tim2 - tim1;
-@@ -29830,6 +30641,40 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -29830,6 +30670,40 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
  
          ggml_barrier(state->shared);
  
@@ -1586,7 +1633,7 @@ index 368bc5e5..02b34ee1 100644
          if (state->shared->ec != GGML_STATUS_SUCCESS) {
              break;
          }
-@@ -29849,6 +30694,16 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+@@ -29849,6 +30723,16 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
  
      int n_threads = cplan->n_threads;
  
@@ -1603,7 +1650,7 @@ index 368bc5e5..02b34ee1 100644
  #if defined(__gnu_linux__)
      // the calling thread is worker 0 and gets pinned below; remember its affinity
      cpu_set_t saved_affinity;
-@@ -29882,6 +30737,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+@@ -29882,6 +30766,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                  // update the number of threads from the actual number of threads that we got from OpenMP
                  n_threads = omp_get_num_threads();
                  state_shared.n_threads = n_threads;
@@ -1611,7 +1658,7 @@ index 368bc5e5..02b34ee1 100644
              }
  
              struct ggml_compute_state worker = {
-@@ -29905,6 +30761,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+@@ -29905,6 +30790,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
      }
  #else
      struct ggml_compute_state * workers = alloca(sizeof(struct ggml_compute_state)*n_threads);
@@ -2057,7 +2104,7 @@ index 00000000..b74b64d3
 +#define _mm_cvtps_ph(a, r)    iqk_avx1_mm_cvtps_ph(a)
 +#define _mm256_cvtps_ph(a, r) iqk_avx1_mm256_cvtps_ph(a)
 diff --git a/ggml/src/iqk/iqk_cpu_ops.cpp b/ggml/src/iqk/iqk_cpu_ops.cpp
-index 8fd51f1c..f99c11e3 100644
+index 8fd51f1c..0e165f8f 100644
 --- a/ggml/src/iqk/iqk_cpu_ops.cpp
 +++ b/ggml/src/iqk/iqk_cpu_ops.cpp
 @@ -449,6 +449,15 @@ void iqk_mul_multi_add(struct ggml_tensor * dst, int ith, int nth) {
@@ -2096,7 +2143,7 @@ index 8fd51f1c..f99c11e3 100644
                  x1 = (const float *)c1;
                  s  = x1[0] * scales[ids[j]];
                  for (int k = 0; k < ne00; ++k) y[k] += x0[k] * s;
-@@ -486,14 +495,14 @@ void iqk_mul_multi_add(struct ggml_tensor * dst, int ith, int nth) {
+@@ -486,15 +495,21 @@ void iqk_mul_multi_add(struct ggml_tensor * dst, int ith, int nth) {
          auto c0 = (const char *)src0->data + ir*src0->nb[2];
          auto c1 = (const char *)src1->data + ir*src1->nb[2];
          auto cy = (      char *)dst->data + ir* dst->nb[1];
@@ -2105,15 +2152,23 @@ index 8fd51f1c..f99c11e3 100644
 +        auto  y = (     float *)cy + k0;
 +        auto x0 = (const float *)c0 + k0;
          auto x1 = (const float *)c1;
-         for (int k = 0; k < ne00; ++k) y[k] = x0[k] * x1[0];
+-        for (int k = 0; k < ne00; ++k) y[k] = x0[k] * x1[0];
++        // a zero weight is an expert dropped by -ser: its output was never written
++        if (x1[0] != 0.0f) {
++            for (int k = 0; k < ne00; ++k) y[k] = x0[k] * x1[0];
++        } else {
++            for (int k = 0; k < ne00; ++k) y[k] = 0.0f;
++        }
          for (int j = 1; j < ne01; ++j) {
              c0 += src0->nb[1];
              c1 += src1->nb[1];
 -            x0 = (const float *)c0;
 +            x0 = (const float *)c0 + k0;
              x1 = (const float *)c1;
++            if (x1[0] == 0.0f) continue;
              for (int k = 0; k < ne00; ++k) y[k] += x0[k] * x1[0];
          }
+     }
 diff --git a/ggml/src/iqk/iqk_gemm_kquants.cpp b/ggml/src/iqk/iqk_gemm_kquants.cpp
 index 53c71ac0..e5d0c0c9 100644
 --- a/ggml/src/iqk/iqk_gemm_kquants.cpp
@@ -2327,6 +2382,29 @@ index 7f973c3a..c71b7c86 100644
  
      ggml_tensor * oa = ggml_mul_mat(ctx0,
              ggml_reshape_3d(ctx0, layer.wo_a, layer.wo_a->ne[0], o_lora_rank, n_groups),
+diff --git a/src/llama-build-context.cpp b/src/llama-build-context.cpp
+index 23e0caff..def813e5 100644
+--- a/src/llama-build-context.cpp
++++ b/src/llama-build-context.cpp
+@@ -1676,9 +1676,15 @@ llm_expert_gating_func_type   gating_op,
+             auto& hparams = lctx.model.hparams;
+             selected_experts = ggml_grouped_topk(ctx, selection_probs, hparams.n_expert_groups, hparams.n_group_used, 2, n_expert_used);
+         } else {
+-            //selected_experts = ggml_top_k_thresh(ctx, selection_probs, n_expert_used,
+-            //        lctx.cparams.min_experts, lctx.cparams.thresh_experts); // [n_expert_used, n_tokens]
+-            selected_experts = ggml_top_k(ctx, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
++            if (lctx.cparams.min_experts > 0 && lctx.cparams.thresh_experts > 0) {
++                selected_experts = ggml_top_k_thresh(ctx, selection_probs, n_expert_used,
++                        lctx.cparams.min_experts, lctx.cparams.thresh_experts); // [n_expert_used, n_tokens]
++                if (selection_probs != probs) {
++                    selected_experts->view_src->src[1] = probs; // threshold on the unbiased weights
++                }
++            } else {
++                selected_experts = ggml_top_k(ctx, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
++            }
+         }
+     }
+ 
 diff --git a/src/llama-hparams.cpp b/src/llama-hparams.cpp
 index 6edf1fe7..0c652b65 100644
 --- a/src/llama-hparams.cpp

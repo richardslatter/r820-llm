@@ -42,6 +42,10 @@ This is a working log, not a polished project. The plan and all measurements are
 | Phase 3e: small matmuls in the model (~12 ms/token above their standalone time) | open: split-K, per-thread activation quantisation and node-local activation copies all tried, no gain |
 | Smart expert reduction (`-ser`) re-enabled | done, opt-in only: +5–9% decode but KLD 0.066–0.151 |
 | Draft-free speculative decoding | done: `--spec-type suffix:n_max=2,n_min=1` gives +5–11% where output repeats the prompt, 0 on free prose; no MTP tensors in the GGUF |
+| DSpark draft model (V4.1's MTP) | done: loads after adding 3 GGUF keys; `dspark:n_max=3` gives **9.0 tok/s** code, 8.0 extraction, 6.3 prose (dq6k) |
+| Long context, threads, prompt speed | done: −14% decode at 16K context; 64 threads best; prompts 10.8 tok/s, compute-bound at 60–70% of AVX1 peak |
+| Imatrix 4-bit dense, 4-bit output head | done: KLD 0.082 → 0.078 (within error), no speed gain; dq6k stays the pick |
+| GPU retest with current kernels | done: layer offload now slows decode; `-ngl 0` on build-cuda gives prompts +40–47% for −2–5% decode; 672 W peak |
 
 First runs (60 threads, stock placement, Q8_0 dense):
 - ik_llama.cpp: **2.31 tok/s** decode, 5.3 tok/s prompt.
@@ -66,7 +70,9 @@ Estimate: ~6.5 tok/s NUMA-local on the CPU; ~12 with the dense part on the GPU a
 | `system/net/` | `net-reconnect.service`: retry DHCP once a minute after a cable-less boot |
 | `ik_llama/ds41_gguf_patch.py` | Lets ik load DeepSeek-V4.1 GGUFs in the Unsloth/mainline layout |
 | `mainline/mxfp8.patch` | The MXFP8 change as applied to mainline llama.cpp |
-| `tools/requant_shard.c` | Requantizes the BF16 tensors of one GGUF shard, copying the rest |
+| `tools/requant_shard.c` | Requantizes the BF16 tensors of one GGUF shard, copying the rest (optionally imatrix-weighted) |
+| `tools/gguf_kv.py` | Dependency-free GGUF metadata dump |
+| `tools/gguf_set_kv.py` | Copies a GGUF, adding or replacing metadata keys (used to make the DSpark draft load in ik) |
 | `ik_llama/numa_pin_patch.py` | Follow-up to numa_patch.py: one CPU per thread, populate before mbind |
 | `tools/placecheck.py` | Reports which node each weight's row quarters actually sit on (move_pages) |
 | `tools/splitpages.py` | Splits tmpfs huge pages to 4 KiB in place (pid/address debugfs form) |
@@ -125,7 +131,17 @@ mkdir -p /mnt/models/dq8 && for i in 1 2 3 4 5 6 7 8; do ln /mnt/models/UD-Q8_K_
 ./requant_shard /mnt/models/UD-Q8_K_XL/*-00009-of-00009.gguf /mnt/models/dq8/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00009-of-00009.gguf q8_0 token_embd.weight=keep
 ```
 
-The variant in use now, `dq6k`, is made the same way with `q6_K` as the type (`iq4_nl output.weight=q6_K` for `diq4`). The plan compares the three.
+The variant in use now, `dq6k`, is made the same way with `q6_K` as the type (`iq4_nl output.weight=q6_K` for `diq4`). The plan compares them.
+
+`--imatrix file.gguf` (before the other arguments) weights the quantisation by the mean squared activations of a GGUF imatrix, such as Unsloth's `imatrix_unsloth.gguf`.
+
+## DSpark draft model
+
+```bash
+python3 tools/gguf_set_kv.py dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf dspark-ik.gguf \
+    dflash.attention.indexer.head_count=u32:32 dflash.attention.indexer.key_length=u32:128 dflash.attention.indexer.top_k=u32:512
+DRAFT=/mnt/models/dspark/dspark-ik.gguf tools/serve.sh
+```
 
 ## Tools
 

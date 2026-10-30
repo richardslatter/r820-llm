@@ -310,7 +310,7 @@ It is faster, but the quality cost is too high, so it stays opt-in. dq6k itself 
 
 ## Speculative decoding without a draft model (2026-10-30)
 
-The GGUF has no MTP/nextn tensors, so only draft-free methods are possible. The question is the cost of verifying a batch: each extra token in the batch brings its own experts.
+The main GGUF has no MTP/nextn tensors. V4.1's predictor is a separate DSpark draft (next section); this section covers the draft-free methods. The question is the cost of verifying a batch: each extra token in the batch brings its own experts.
 
 Verify cost (`llama-bench -p N`, dq6k, 64 threads):
 
@@ -343,9 +343,135 @@ Recommended server flag: `--spec-type suffix:n_max=2,n_min=1`.
 
 Note: `--jinja` with the GGUF's own template fails in ik's jinja engine ("Callee is not a function"). The server works around this with `--chat-template-file`.
 
-## Ideas for cutting the per-token weight read (not yet tried, 2026-10-30)
+## DSpark draft model (2026-10-30)
 
-At dq6k each token reads ~10.9 GB: experts 4.5, dense 6.1, f32 router/hc 0.3. That is ~98 ms at 110 GB/s. None of the following has been run yet. They are listed best first.
+V4.1's "MTP" is a separate 3-block DSpark draft. It reads the target's hidden states from layers 37–39 and borrows the target's embedding and output head. It drafts a block of up to 5 tokens in one pass.
+
+Unsloth ships it as `dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf` (8.0 GB, arch `dflash`, experts MXFP4). ik's tensor names match, but ik reads the DSA indexer keys for every DeepSeek-V4 stage and the file has none, so loading fails with "key not found in model: dflash.attention.indexer.head_count".
+
+The draft's stages are uncompressed, so the keys are never used. Adding them with the target's values makes it load:
+
+```
+tools/gguf_set_kv.py dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf dspark-ik.gguf \
+    dflash.attention.indexer.head_count=u32:32 dflash.attention.indexer.key_length=u32:128 \
+    dflash.attention.indexer.top_k=u32:512
+```
+
+Usage: `-md dspark-ik.gguf --spec-type dspark:n_max=N`. The draft's experts add ~8 GB of RAM.
+
+`llama-spec-bench`, dq6k, 64 threads, 192 tokens, greedy, tok/s (accepted fraction of drafted tokens in brackets):
+
+| Setting | code | extract | story |
+|---|---|---|---|
+| No drafting | 6.31 | 6.20 | 6.54 |
+| `dspark:n_max=1` | 7.55 (98%) | 6.83 (93%) | 6.21 (60%) |
+| `dspark:n_max=2` | 7.99 (95%) | 7.58 (93%) | 6.02 (56%) |
+| `dspark:n_max=3` | 9.04 (94%) | 8.02 (89%) | 6.25 (59%) |
+| `dspark:n_max=4` | 10.03 (93%) | 8.39 (90%) | 5.69 (51%) |
+
+- **Code and extraction: +27–59%.** Acceptance stays around 90% at every draft position, so longer drafts keep paying even though verifying 5 tokens costs 2.8× one token.
+- **Free prose: no gain.** Acceptance is ~60% for the first token and falls with position, and n_max=4 is 13% slower than no drafting.
+- A round costs the verify batch plus ~60–90 ms of drafting. The draft is 3 MoE blocks plus the shared 129k-row output head.
+- Combining with suffix drafting is refused ("two-stage speculative mode currently requires a self-spec stage first").
+- The code task stops at end-of-text after 90 tokens in some runs and runs to 192 in others. Batched verification changes the rounding, which is enough to flip a greedy choice late in the answer.
+- **`p_min` does not rescue prose.** The draft is confident even where it is wrong, so the cutoff rarely shortens a draft:
+
+  | Setting | code | extract | story |
+  |---|---|---|---|
+  | `n_max=4,p_min=0.5` | 10.08 | 8.18 | 5.60 |
+  | `n_max=4,p_min=0.7` | 9.99 | 8.34 | 5.68 |
+  | `n_max=5,p_min=0.7` | 9.86 | 8.09 | 5.68 |
+  | `n_max=3,p_min=0.5` | 9.17 | 8.05 | 6.18 |
+
+Recommended: `-md dspark-ik.gguf --spec-type dspark:n_max=3`. It gives +27–43% on code and extraction and costs ~4% on free prose. Use `n_max=4` for code-only work.
+
+## Context length, threads and prompt processing (2026-10-30)
+
+dq6k, build-dev, 64 threads unless noted:
+
+| Test | tok/s |
+|---|---|
+| Decode, 32 / 48 / 64 threads | 6.27 / 6.26 / 6.54 |
+| Decode after 0 / 4K / 8K / 16K prompt tokens | 6.69 / 5.95 / 5.86 / 5.78 |
+| Prompt, pp512 | 10.8 |
+
+- **Long context costs little:** −11% at 4K, −14% at 16K. The 128-token sliding window and the compressed/sparse layers keep attention small.
+- **64 threads stays best.** Hyper-threads still help by 4%.
+- **Prompt processing is compute-bound, not memory-bound.** One pp512 graph takes 24.0 s:
+
+  | Part | Time | Rate |
+  |---|---|---|
+  | Dense Q6_K matmuls | 8.7 s | ~0.87 TFLOP/s |
+  | Routed experts, MXFP4 (up/gate 7.2 s, down 3.3 s) | 10.5 s | ~0.83 TFLOP/s |
+  | Flash attention | 2.2 s | |
+  | Shared expert | 1.5 s | |
+
+  Peak AVX1 float throughput for 32 cores at 2.4–2.8 GHz is ~1.2–1.4 TFLOP/s, so the batched kernels (SIMDe path) already run at 60–70% of peak. A faster CPU kernel can add at most ~1.4×. A 4K-token prompt takes ~6 minutes. The GPU is the only large lever for prompts (next section).
+
+## GPU retest with the current kernels (2026-10-30)
+
+build-cuda (all current patches, sm_61), dq6k, 64 threads, `LLAMA_OT_CPU_MMAP=1 -ot exps=CPU`:
+
+| `-ngl` | Prompt pp512 tok/s | Decode tg32 tok/s |
+|---|---|---|
+| CPU build | 10.8 | 6.69 |
+| 0 | 15.2 | 6.38 |
+| 20 | 16.1 | 5.59 |
+| 28 | 16.5 | 5.44 |
+| 34 | context creation fails (5 GB) | |
+
+- **Offloading layers now slows decode.** Decode used to be +13% at `-ngl 20`, but the CPU kernels have since doubled in speed. The CPU↔GPU syncs per offloaded layer now cost more than the dense weights the GPU takes over.
+- **The GPU still helps prompts, with no layers on it.** At `-ngl 0` ik copies the weights of large-batch ops to the GPU (`offload-batch-size`, 32 rows), so dense matmuls and attention run there.
+  - The routed experts stay on the CPU: they only offload when batch × 6 ≥ 32 × 384.
+  - That is correct here, since a layer's experts are ~7 GB over PCIe 3.
+  - pp2048: CPU 10.1, GPU with `-ub` 512 / 1024 / 2048 (`offload-batch-size=512`): 14.8 / 14.9 / 14.7. The batch size makes no difference.
+- **Server choice:** build-cuda with `-ngl 0` gives prompts +40–47% for −2–5% decode. Plain CPU is better for short-prompt, decode-heavy use.
+- **Power:** peak 672 W at the wall with the CPUs and GPU loaded (GPU ≤ 38 W), under the 740 W policy. Cores held 2.5 GHz.
+
+## Server setups compared (2026-10-30)
+
+The LAN server has been running `diq4` (IQ4_NL dense, no imatrix) on build-cpu. Measured against the current build and drafting:
+
+| Build, model | tg32 | tg32 after 512 prompt tokens |
+|---|---|---|
+| build-cpu, diq4 | 7.25 | 6.49 |
+| build-dev, diq4 | 7.34 | 6.71 |
+
+`llama-spec-bench`, diq4, build-dev, tok/s (acceptance in brackets):
+
+| Setting | code | extract | story |
+|---|---|---|---|
+| No drafting | 7.26 | 6.76 | 7.13 |
+| `dspark:n_max=3` | 7.84 (82%) | 8.01 (88%) | 6.53 (62%) |
+
+- build-cpu is only 1–3% behind build-dev on decode. Rebuilding the server is not worth a restart on its own.
+- The draft accepts less against diq4 (82% on code against 94% at dq6k). The 4-bit target disagrees with the draft more often, so dspark gains less there.
+- **Best overall: dq6k + `dspark:n_max=3`.** Code 9.0, extraction 8.0, prose 6.3 tok/s, at KLD 0.018 instead of 0.082. diq4 alone is only faster on free prose (7.1).
+- `tools/serve.sh` takes `DRAFT=/mnt/models/dspark/dspark-ik.gguf` (and `NMAX`) to add the draft.
+
+## Imatrix 4-bit dense and a 4-bit output head (2026-10-30)
+
+`requant_shard --imatrix` with Unsloth's `imatrix_unsloth.gguf` (558 chunks of 4096 tokens). It covers 349 of the 350 dense BF16 tensors plus the output head; token_embd has no entry. attn_output_a's imatrix holds 8 slices, one per group of 1024 rows.
+
+KLD against the BF16-dense model (16 × 256 tokens of wikitext-2), decode on build-dev (2 runs):
+
+| Variant | Dense | Head | KLD | Same top token | tg32 | tg32 after 512 |
+|---|---|---|---|---|---|---|
+| dq6k | Q6_K | Q6_K | 0.018 | 96.8% | 6.69 | 6.17 |
+| diq4 | IQ4_NL | Q6_K | 0.082 ± 0.006 | 92.8% | 7.40 | 6.74 |
+| diq4i | IQ4_NL + imatrix | Q6_K | 0.078 ± 0.006 | 93.1% | 7.25 | 6.73 |
+| diq4io | IQ4_NL + imatrix | IQ4_NL + imatrix | 0.080 ± 0.006 | 93.0% | 7.35 | 6.68 |
+
+- **The imatrix barely helps:** −5%, inside the error bars. The loss comes from 4-bit storage of the dense attention weights, not from unweighted rounding. Idea 3's guess (imatrix as the reason for 0.082) was wrong.
+- **The 4-bit head costs nothing measurable in quality, but gains nothing measurable in speed.** It saves 0.17 GB per token (~1.5 ms), below the run-to-run noise.
+- Reaching dq6k quality at ~4.7 GB would need a 5-bit mix (IQ5_KS / Q5_K on the attention weights) and AVX1 kernels for those types. At most ~10 ms per token (~6%), so it stays low priority.
+- dq6k stays the pick. Each variant was a 40 s rewrite of shard 9 next to hard links of shards 1–8.
+
+## Ideas for cutting the per-token weight read (2026-10-30)
+
+At dq6k each token reads ~10.9 GB: experts 4.5, dense 6.1, f32 router/hc 0.3. That is ~98 ms at 110 GB/s. They are listed best first.
+
+Status: 2 measured (`-ser`, opt-in only), 3 and 6 measured (4-bit sections below), 5 done (suffix and DSpark drafting). 1 needs the physical DIMM change; 4 needs engine work.
 
 1. **2 DIMMs per channel at 1600 MT/s** (+20% bandwidth, ~98 → ~82 ms).
    - The DIMMs are rated 1600; 3 per channel caps them at 1333.
