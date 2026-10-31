@@ -482,7 +482,7 @@ The shared expert (0.15 GB of Q6_K per token) is the one dense FFN piece small e
 
 - **Slower in every form.** Each CPU↔GPU hand-off inside ggml costs ~100–165 µs (set/get on `cudaStreamPerThread` plus a sync), against 15–25 µs for the same copies in a standalone CUDA test. Two hand-offs per layer add ~18 ms per token. The CPU saves only ~4.5 ms.
 - Even with zero overhead the ceiling is 3–8%, so this is closed.
-- **Draft model on the GPU** (`-draft "-ngl 99 -ot exps=CPU"`: dense draft weights on the P2200, draft experts on the CPU) computes wrong: acceptance falls from 94% to 55% on code and from 59% to 34% on prose. Some draft op differs on CUDA. Per-round time did not improve either, so it is parked.
+- **Draft model on the GPU** (`-draft "-ngl 99 -ot exps=CPU"`: dense draft weights on the P2200, draft experts on the CPU) computed wrong: acceptance fell from 94% to 55% on code and from 59% to 34% on prose. Fixed; see "Draft on the GPU: two bugs" below.
 
 ## Draft cost on the CPU (2026-10-31)
 
@@ -627,6 +627,59 @@ What is left at batch 4 (~290 ms per graph):
 
 **HC_POST order.** Token-major tasks give thread *i* a few whole tokens, so it reads columns that 64 other threads wrote in the matmul before. Chunk-major tasks (now the default; `GGML_HC_POST_SPLIT=1` for token-major) give it the same 64 columns of every token, which is exactly what its share of that matmul wrote. Output is bit-identical. HC_POST itself did not get faster (6.1 vs 6.5 ms), but the op that next reads its output, MUL_MULTI_ADD, went 3.4 → 2.1 ms (per-thread average 2.85 → 1.05), and the batch-4 graph went 289.8 → 286.9 ms. `pp4` was 13.08 / 12.80 vs 13.07 / 13.11 tok/s, within the noise.
 
+## Draft on the GPU: two bugs (2026-10-31)
+
+With the DSpark draft's dense weights on the P2200 (`-draft "-ngl 99 -ot exps=CPU"`), code acceptance fell from ~91% to ~55%. Two separate bugs caused it. Both are fixed, and the GPU draft now accepts exactly the same tokens as the CPU draft.
+
+**1. The scheduler copied the draft's K/V cache before the GPU had written it** (`sched_input_sync_patch.py`).
+- The draft's K/V cache tensors are flagged as graph inputs but live in their layer's buffer, so with the draft on the GPU they are written by SET_ROWS on the CUDA compute stream.
+- They are read by the CPU attention: sinks at head size 512 have no Pascal kernel.
+- The scheduler copies input tensors after waiting only for the split's own backend. The copy runs on `cudaStreamPerThread`, which does not wait for the non-blocking compute stream, so the CPU could read rows not yet written.
+- `CUDA_LAUNCH_BLOCKING=1` raised acceptance to 59%, which pointed at a race. The fix waits for the tensor's own backend before the copy, once per backend per split.
+- With only this fix: `-ngl 1` 92.5%, `-ngl 2` 91.8%, `-ngl 3` 57.9%, `-ngl 99` 56.6%. So a second bug was in the draft's layer 0 (draft layer *n* is offloaded once `-ngl` passes it).
+
+**2. In-place ROPE_BACK in the draft graph** (`ds41_rope_back_patch.py`, second site).
+- `build_dflash_dsv4` de-rotates the attention output with an in-place rope turned into ROPE_BACK with flipped dims, the same pattern that broke the target model on CUDA earlier.
+- A per-node trace (eval callback, CPU vs GPU layer 0) matched the K/V cache and every node up to the de-rotation; the next matmul, `attn_wo_a`, was 34% off.
+- A standalone CPU-vs-CUDA op test ruled out the REPEAT and concat nodes nearby: both were exact.
+- Out of place, the CUDA kernel takes the flip as a parameter and the result matches.
+
+With both fixes, `-ngl 99` and `-ngl 3` give 91.22% (135/148) on code, the same as the CPU draft.
+
+**Speed (dq6k, DSpark `n_max=3`, n=192, build-cuda `-ngl 0` for the target):**
+
+| Draft placement | code tok/s | code accepted | story tok/s | story accepted |
+|---|---|---|---|---|
+| CPU (`-ngl 0`) | 9.68 / 9.53 | 135/148 | 6.29 / 6.01 | 83/167 |
+| GPU (`-ngl 99 -ot exps=CPU`) | 8.48 / 8.68 | 135/148 | 5.50 / 5.47 | 83/168 |
+
+Two runs each, interleaved. The GPU draft is ~10% slower on code and ~11% on prose. Each draft layer hands its experts' input and output across PCIe, and each hand-off inside ggml costs ~100–165 µs, the same overhead that sank the shared expert on the GPU. The draft stays on the CPU. The two fixes stay in the patch set because they make any split CPU/GPU DFlash setup correct.
+
+## Decode attention at long context (2026-10-31)
+
+At 4K context, decode drops from ~6.5 to ~5.8 tok/s (dq6k, build-cuda `-ngl 0`, no draft). `GGML_OP_PROF=2` puts the decode attention at 40 calls × ~330 µs = 13.2 ms per token, ~7.5% of decode and most of the gap. The kernel's own timers (`GGML_FA_MQA_PROF=1`, 1360 calls), average µs per call:
+
+| setup | fp16→fp32 | QK | softmax | PV | barrier | merge |
+|---|---|---|---|---|---|---|
+| 35 | 88 | 72 | 12 | 47 | 28 | 35 |
+
+Three changes were tried. None moved end-to-end decode beyond run-to-run noise, so none is in `r820.patch`:
+
+1. **Head partitions** (`fa_parts_patch.py`, `GGML_FA_MQA_PARTS`): threads split over head groups as well as KV rows, so each converts fewer rows.
+2. **Out-of-line PV kernels and a 16-wide mask scan** (`fa_decode_tweaks_patch.py`). In a single-thread loop, inlining made the PV kernels ~1.6× slower. Output is bit-identical.
+3. **One-multiply fp16→fp32** (`f16_magic_patch.py`): ~25% faster conversion in isolation, and bit-identical over all 65536 inputs.
+
+| Variant | tg32 | tg32 @ 4096 |
+|---|---|---|
+| Partitions 1 (default) | 6.38 / 6.71 | 5.71 / 5.96 |
+| Partitions 4 | 6.69 / 6.75 | 5.63 / 5.62 |
+| Partitions 16 | 6.83 / 6.75 | 5.82 / 5.85 |
+| Base | 6.39 / 6.60 | 5.93 / 5.75 |
+| + PV out of line, mask scan | 6.54 / 6.60 | 5.84 / 5.73 |
+| + one-multiply fp16 | 6.53 / 6.40 | 5.85 / 5.80 |
+
+(tok/s, two runs each in alternating order.) Even removing all of the attention would gain only ~8% at 4K. What is left there is mostly the fp16 conversion and the QK dot products, both set by the cache size. Long context is closed for now.
+
 ## Ideas for cutting the per-token weight read (2026-10-30)
 
 At dq6k each token reads ~10.9 GB: experts 4.5, dense 6.1, f32 router/hc 0.3. That is ~98 ms at 110 GB/s. They are listed best first.
@@ -752,16 +805,26 @@ Decode speed ≈ usable bandwidth ÷ bytes per token. **The BF16 dense weights a
 4. Layer-by-layer comparison against the reference implementation.
 5. **Expected at Q4: ~13.5 tok/s at 1333, ~17 at 1600, 20–25 with GPU and speculative decoding.**
 
-## Targets (no purchases), revised for the measured model
+## Targets (no purchases): estimates against measurements (2026-10-31)
 
-| | As downloaded (BF16 dense, ~20 GB/token) | Dense → Q8_0 (~12.7 GB/token) | Dense ~4.5-bit on the GPU, experts on the CPU |
-|---|---|---|---|
-| Stock llama.cpp (interleaved) | ~1.5 | ~2.5 | – |
-| NUMA-local engine, CPU only | ~4 | ~6.5 | – |
-| + GPU | – | – | ~12 |
-| + speculative decoding (DSpark, ×1.3–1.5) | – | ~8–10 | **~16–19** |
+Decode tok/s. The estimates are the ones this plan started with; the measurements are llama-bench / llama-spec-bench at 64 threads, `GGML_NUMA_BLOCKED=1 GGML_NUMA_PLACE=1`.
 
-To be replaced by measurements.
+| Setup | Estimate | Measured |
+|---|---|---|
+| Stock llama.cpp, as downloaded (BF16 dense) | ~1.5 | 1.22 (mainline, 60 threads) |
+| Stock, Q8_0 dense | ~2.5 | 1.58 mainline, 2.60 ik |
+| NUMA-local engine, CPU only, Q8_0 dense | ~6.5 | 5.94 |
+| NUMA-local engine, CPU only, Q6_K dense (the pick) | – | **6.7–7.0** (5.8 at 16K context) |
+| + dense part on the GPU | ~12 | slower: −2–5% at `-ngl 0`, −16–19% with layers on the GPU; shared expert alone −13% |
+| + speculative decoding (DSpark), code-like output | ~16–19 (with the GPU) | **9.7** (`n_max=3`), **10.2–11.0** (`n_max=4`) |
+| + speculative decoding (DSpark), free prose | | 6.3 |
+| Prompt processing, pp512 | – | 10.8 CPU only, **15.2** build-cuda `-ngl 0` |
+
+- The GPU plan assumed the P2200 would add bandwidth. The CPU kernels doubled in speed instead, and each CPU↔GPU hand-off in ggml costs 100–165 µs, so offloading anything per token now loses.
+- Speculative decoding gives ×1.45–1.6 on code, about what Phase 4 expected. On prose the draft is accepted too rarely to gain.
+- The DSpark draft on the GPU now computes correctly (two bugs fixed, see "Draft on the GPU: two bugs"), but it is ~10% slower than on the CPU, so the draft stays on the CPU.
+- Long context: 5.7–5.9 tok/s at 4K. Attention is ~7.5% of decode there, and three kernel changes gained nothing measurable.
+- Still to try, needs you to do it: 2 DIMMs per channel at 1600 MT/s (see "Ideas for cutting the per-token weight read"), about +15–20% decode.
 
 ## Sources
 

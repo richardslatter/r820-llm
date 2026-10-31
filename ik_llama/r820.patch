@@ -134,6 +134,22 @@ index 486c4440..75207eee 100644
      if (GGML_IQK_FLASH_ATTENTION)
          message(STATUS "Enabling IQK Flash Attention kernels")
          add_compile_definitions(GGML_IQK_FLASH_ATTENTION)
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index d2a74454..95f40491 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -2072,6 +2072,11 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
+                 }
+                 synced_on_input = true;
+             }
++            // an input kept on another backend (the DFlash K/V cache) may still be being written there
++            if (input_backend != split_backend && input_backend != last_input_backend) {
++                ggml_backend_synchronize(input_backend);
++                last_input_backend = input_backend;
++            }
+             ggml_backend_tensor_copy(input, input_cpy);
+         } else {
+             // wait for the split backend to finish using the input before overwriting it
 diff --git a/ggml/src/ggml-common.h b/ggml/src/ggml-common.h
 index 434aad15..9664fe68 100644
 --- a/ggml/src/ggml-common.h
@@ -2595,7 +2611,7 @@ index 32c523aa..e90f38b4 100644
          MulMat mm;
          if (!MulMat::prepare(typeA, typeB, ne00, mm, Ny)) {
 diff --git a/src/graphs/build_deepseek4.cpp b/src/graphs/build_deepseek4.cpp
-index 7f973c3a..c71b7c86 100644
+index 7f973c3a..51e43015 100644
 --- a/src/graphs/build_deepseek4.cpp
 +++ b/src/graphs/build_deepseek4.cpp
 @@ -1148,11 +1148,11 @@ static ggml_tensor * ds4_build_engram(ggml_context * ctx0, llm_build_context & l
@@ -2632,6 +2648,15 @@ index 7f973c3a..c71b7c86 100644
  
      ggml_tensor * oa = ggml_mul_mat(ctx0,
              ggml_reshape_3d(ctx0, layer.wo_a, layer.wo_a->ne[0], o_lora_rank, n_groups),
+@@ -1991,7 +1995,7 @@ ggml_cgraph * llm_build_context::build_dflash_dsv4() {
+         ggml_build_forward_expand(gf, attn);
+ 
+         attn = ggml_reshape_3d(ctx0, attn, n_embd_head, n_head, n_tokens);
+-        attn = ggml_rope_ext_inplace(ctx0, attn, inp_pos, nullptr, n_embd_head_rope, rope_type, 0,
++        attn = ggml_rope_ext(ctx0, attn, inp_pos, nullptr, n_embd_head_rope, rope_type, 0,
+                 freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+         attn->op = GGML_OP_ROPE_BACK;
+         attn->op_params[15] = 1;
 @@ -2475,7 +2479,7 @@ static ggml_tensor * ds4_attention_v41(ggml_cgraph * gf, ggml_context * ctx0, ll
      ggml_build_forward_expand(gf, attn);
  

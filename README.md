@@ -66,7 +66,7 @@ Estimate: ~6.5 tok/s NUMA-local on the CPU; ~12 with the dense part on the GPU a
 | `ik_llama/r820.patch` | All local changes to ik_llama.cpp (AVX1 SIMDe build + NUMA-local engine), including the new shim header |
 | `ik_llama/numa_patch.py` | Script that applies the NUMA part of the patch to a clean checkout |
 | `ik_llama/mxfp8_patch.py` | Adds the MXFP8 type (gather-only) to ik or mainline; the Engram table needs it |
-| `ik_llama/ds41_rope_back_patch.py` | Out-of-place attention rope-back: fixes the CUDA (sm_61) path for DeepSeek-V4.1 |
+| `ik_llama/ds41_rope_back_patch.py` | Out-of-place attention rope-back: fixes the CUDA (sm_61) path for DeepSeek-V4.1 and for the DSpark draft |
 | `ik_llama/fattn_sinks_patch.py` | Attention sinks in ik's Pascal head-size-512 flash-attention kernel |
 | `ik_llama/ds41_wo_a_cont_patch.py` | Contiguous input for the grouped output projection's batched matmul |
 | `scripts/restore-ramdisk.sh` | Refill the RAM disk from the NAS after a power cycle |
@@ -97,6 +97,8 @@ Estimate: ~6.5 tok/s NUMA-local on the CPU; ~12 with the dense part on the GPU a
 | `ik_llama/sched_defer_patch.py` | Negative result, not in `r820.patch`: lets a CPU split start before the GPU results it needs later are copied in (`GGML_SCHED_DEFER=0` off) |
 | `ik_llama/hc_post_patch.py`, `ik_llama/dup_rows_patch.py` | HC_POST and same-type copies split over all threads when there are only a few tokens (`GGML_HC_POST_SPLIT=0` off) |
 | `ik_llama/kslice_patch.py` | Few-row f32 matmuls (hyper-connection mixes) split along the norm's K-slices, weights placed by column quarters (`GGML_MUL_MAT_KSLICE=0` off) |
+| `ik_llama/sched_input_sync_patch.py` | Scheduler waits for the backend that holds an input-flagged tensor (the DFlash/DSpark K/V cache) before copying it; fixes the draft on the GPU |
+| `ik_llama/fa_parts_patch.py`, `ik_llama/fa_decode_tweaks_patch.py`, `ik_llama/f16_magic_patch.py` | No measurable gain, not in `r820.patch`: decode attention over head partitions (`GGML_FA_MQA_PARTS`); PV kernels out of line and a 16-wide mask scan; one-multiply fp16→fp32 |
 | `tools/f16c_test.cpp` | Exhaustive check of the fp16 conversions |
 | `tools/serve.sh`, `tools/v4_chat.jinja` | LAN chat server (llama-server, web UI on :8080) and a plain chat template it can parse |
 | `tools/mmcheck.c` | ggml `mul_mat` / `mul_mat_id` checker against a double-precision reference |
