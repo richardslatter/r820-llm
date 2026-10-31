@@ -29,7 +29,7 @@ Unsloth's UD-Q8_K_XL with the BF16 dense weights requantised to Q6_K (KLD 0.018 
 
 The server runs the CUDA build with every layer on the CPU (`-ngl 0`): prompts go through the GPU for attention and the dense projections, decode stays on the CPU. The second targets were 30 tok/s prompts (met) and 15 tok/s decode (not met, 12.3 on code: [where the verify time goes](docs/plan.md#second-targets-30-toks-prompts-15-toks-decode-2026-10-31)).
 
-Through the LAN server's chat API (build-cuda, DSpark `n_max=4`, 256 tokens, `scripts/apitest.sh`): code 10.1 tok/s, prose 7.0; the CPU build gives 10.3 and 7.1. Chat prompts are less predictable for the draft than the benchmark's code task (~3 tokens accepted per round instead of 4.7), hence ~10 rather than 12. [Demo video](docs/media/r820-deepseek-demo.mp4), real time: a coding prompt with thinking on, 832 tokens at 9.0 tok/s (thinking 8.4, code answer 11.3; the previous recording of the same prompt was 8.7 overall). It is drawn from the logged arrival time of each streamed chunk (`tools/demo/`).
+Through the LAN server's chat API (build-cuda, DSpark `n_max=4`, 256 tokens, `scripts/apitest.sh`): code 10.1 tok/s, prose 7.0; the CPU build gives 10.3 and 7.1. Chat prompts are less predictable for the draft than the benchmark's code task (~3 tokens accepted per round instead of 4.7), hence ~10 rather than 12. [Demo video](docs/media/r820-deepseek-demo.mp4) ([vertical, with a live tok/s readout](docs/media/r820-deepseek-demo-vertical.mp4)), real time: a coding prompt with thinking on, 832 tokens at 9.0 tok/s (thinking 8.4, code answer 11.3; the previous recording of the same prompt was 8.7 overall). It is drawn from the logged arrival time of each streamed chunk (`tools/demo/`).
 
 ## What was done
 
