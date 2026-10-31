@@ -18,10 +18,16 @@ Unsloth's UD-Q8_K_XL with the BF16 dense weights requantised to Q6_K (KLD 0.018 
 | Stock llama.cpp (Q8_0 dense) | 1.58 |
 | Stock ik_llama.cpp (Q8_0 dense) | 2.60 |
 | **This repo, no draft** | **6.7** (5.8 at 4K–16K context) |
-| **This repo + DSpark draft, code** | **9.6–9.7** (`n_max=3`), 10.9 (`n_max=4`) |
-| This repo + DSpark draft, free prose | 6.0–6.7 |
+| **This repo + DSpark draft, code** | **10.7** (`n_max=3`), 12.3 (`n_max=4`) |
+| This repo + DSpark draft, free prose | 6.5–6.8 |
 
-Prompt processing runs at 15.2 tok/s (pp512) on the CUDA build with `-ngl 0`, against 10.8 on the CPU-only build.
+| | Prompt tok/s (pp512) |
+|---|---|
+| This repo before the batched kernels (`GGML_AVX1_GEMM=0`) | 10.6 |
+| **This repo, CPU only** | **23.9** |
+| This repo, CUDA build with `-ngl 0` | 26.1 |
+
+Through the LAN server's chat API (CPU build, DSpark `n_max=3`, 256 tokens): code 10.4 tok/s, prose 7.0. [Demo video](docs/media/r820-deepseek-demo.mp4), real time: a coding prompt with thinking on, 622 tokens at 8.7 tok/s (thinking 8.0, code answer 10.2). It is drawn from the logged arrival time of each streamed chunk (`tools/demo/`).
 
 ## What was done
 
@@ -43,8 +49,9 @@ Each row is measured decode, in order.
 | **DSpark draft model** (V4.1's MTP): 3 missing GGUF keys added (`tools/gguf_set_kv.py`) | Code 9.0 with `n_max=3` |
 | **Cheaper draft:** shared output head instead of a single-node copy, SSE2 softmax | Draft round 66–70 → ~33 ms |
 | **Faster verify batch:** Q6_K batch kernel, HC_POST and copy splits, f32 K-slice | `pp4` 11.15 → 12.9; code 9.6–9.7, 10.9 at `n_max=4` |
+| **Batched AVX1 kernels** for the MXFP4 experts and Q6_K dense (`iqk_avx1_gemm.h`). A tile of weights and activations is unpacked once into a lane layout where `pmaddubsw` + `pmaddwd` leave each block's dot product in its own lane, with no transposes. | Prompts 10.6 → 23.9 tok/s on the CPU alone; verify batch 285 → 256 ms; code 10.0 → 10.7, prose 6.3 → 6.8 |
 | **CUDA correctness on Pascal:** out-of-place rope-back, attention sinks in the hs512 kernel, contiguous `wo_a` input, scheduler input sync | GPU output matches the CPU (perplexity 3.5047 vs 3.5081); the DSpark draft also runs correctly on the GPU |
-| **CUDA build with `-ngl 0`** | Prompts +40–47% (large batches go to the GPU), decode −2–5% |
+| **CUDA build with `-ngl 0`** | Prompts +40–47% before the batched kernels (large batches go to the GPU). Now only 26.1 against 23.9, with decode −3%, so the server runs the CPU build. |
 
 ## What didn't work
 

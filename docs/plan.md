@@ -408,6 +408,8 @@ dq6k, build-dev, 64 threads unless noted:
 
   Peak AVX1 float throughput for 32 cores at 2.4–2.8 GHz is ~1.2–1.4 TFLOP/s, so the batched kernels (SIMDe path) already run at 60–70% of peak. A faster CPU kernel can add at most ~1.4×. A 4K-token prompt takes ~6 minutes. The GPU is the only large lever for prompts (next section).
 
+  *Correction (2026-10-31):* the profiler averaged a short warm-up with the pp512 graph, so these times are half the real ones and the kernels ran at ~30–35% of peak. Native batched kernels took pp512 to 23.9 tok/s on the CPU alone (see "Batched AVX1 kernels for prompts and the verify batch").
+
 ## GPU retest with the current kernels (2026-10-30)
 
 build-cuda (all current patches, sm_61), dq6k, 64 threads, `LLAMA_OT_CPU_MMAP=1 -ot exps=CPU`:
@@ -680,6 +682,72 @@ Three changes were tried. None moved end-to-end decode beyond run-to-run noise, 
 
 (tok/s, two runs each in alternating order.) Even removing all of the attention would gain only ~8% at 4K. What is left there is mostly the fp16 conversion and the QK dot products, both set by the cache size. Long context is closed for now.
 
+## Batched AVX1 kernels for prompts and the verify batch (2026-10-31)
+
+**The earlier prompt profile was off by 2×.** `llama-bench -r 1` runs a short warm-up and then the pp512 graph, and the profiler averages over both, so the times under "Context length, threads and prompt processing" are half the real ones. A pp512 takes ~48 s on the CPU build: dense Q6_K 17 s, expert up/gate 14 s, expert down 6.7 s, attention 4.4 s. The kernels ran at ~0.45 TFLOP/s, not "60–70% of peak", so there was room left.
+
+**Why the old kernels were slow on batches.** The gemv kernels handle up to 8 columns per call. For each 8 columns they unpack every weight block again, transpose four block sums per row and column, and spill their accumulators. At 512 columns the SIMDe Q8_0_R8 path took over, which emulates AVX2 instructions.
+
+**New kernels** (`iqk_avx1_gemm.h`, `avx1_gemm_patch.py`, `q6_gemm_patch.py`):
+- A tile of 2 weight rows and all activation columns is first unpacked into int8 scratch. The four blocks of a 128-value group are interleaved in 4-byte lanes, so `pmaddubsw` + `pmaddwd` leave block *b*'s dot product in lane *b*, with no transpose.
+- The unpack, the scales and the block-sum corrections are done once and shared by every row and column of the tile.
+- Q6_K keeps its quants unsigned (0..63). Four `pmaddubsw` results can overflow int16, but `paddw` wraps, and the −32 offset comes off with one `psubw` against precomputed activation-pair sums. The true value fits in int16 (8 × 32 × 127 = 32512), so the result is exact. The sub-block scales then go on with `pmaddwd`.
+- `GGML_AVX1_GEMM=<n>` (default 3) is the smallest batch that uses them; 0 turns them off. While they are on, MXFP4 and Q6_K stay off the SIMDe dequant path.
+
+Test harness (`tools/gemm_bench.cpp`, `tools/q6_bench.cpp`, 64 threads, GMAC/s). Output matches the gemv kernels bit for bit, and both match a double-precision reference.
+
+| Batch | Q6_K old | Q6_K new | Q6_K new, weights streamed from RAM (GB/s) |
+|---|---|---|---|
+| 1 | 232 | 228 | 105 |
+| 4 | 353 | 473 | 87 (old 67) |
+| 8 | 352 | 551 | 56 (old 36) |
+| 16 | 352 | 590–674 | |
+| 32 | 353 | 582–714 | |
+
+The MXFP4 kernel gains in the same way.
+
+In the model (dq6k, 64 threads):
+
+| | before | MXFP4 kernel | + Q6_K kernel |
+|---|---|---|---|
+| pp512, CPU build (tok/s) | 10.55 | 14.69 | **23.86** |
+| pp512, build-cuda `-ngl 0` | 15.2 | 26.13 | (Q6_K runs on the GPU there) |
+| Dense Q6_K per pp512 (s) | 17.3 | 17.1 | 5.5 |
+| Expert up/gate + down per pp512 (s) | 21.0 | 7.8 | 7.8 |
+| `pp4` graph, CPU build (ms) | | 285 | 256 |
+
+`llama-spec-bench`, dq6k, DSpark, 192 tokens, tok/s:
+
+| Build | `n_max` | code | story |
+|---|---|---|---|
+| build-cpu, MXFP4 kernel | 3 | 10.02 | 6.31 |
+| build-cpu, MXFP4 kernel | 4 | 10.41 | 6.19 |
+| build-cuda `-ngl 0`, MXFP4 kernel | 3 | 9.71 | 6.13 |
+| build-cuda `-ngl 0`, MXFP4 kernel | 4 | 11.32 | 5.95 |
+| **build-cpu, both kernels** | 3 | **10.69** | **6.75** |
+| **build-cpu, both kernels** | 4 | **12.29** | 6.45 |
+
+- Acceptance and rounds are unchanged, token for token, so the output is the same.
+- The `n_max=4` code run stops at an end-of-text token after 90 tokens, so its rate is for a shorter run.
+- The batch-4 experts are untouched: each expert sees one or two of the four tokens, so they still run as gemv.
+- **Server choice changes:** the CPU build now has prompts at 23.9 tok/s and the fastest decode, so the server runs it, not build-cuda.
+- The verify batch is now 256 ms against 146 ms for one token, which caps what drafting can gain on prose.
+
+KL divergence against BF16 on the prompt path (`llama-perplexity -ub 256`, 16 × 256 tokens), which used to dequantise Q6_K to Q8_0_R8:
+
+| | old path (`GGML_AVX1_GEMM=0`) | batched kernels |
+|---|---|---|
+| Mean KLD | 0.0191 ± 0.0013 | 0.0201 ± 0.0016 |
+| 99th percentile KLD | 0.319 | 0.328 |
+| Same top token | 96.80 ± 0.39% | 96.85 ± 0.39% |
+| PPL(Q)/PPL(BF16) | 1.0111 ± 0.0066 | 1.0102 ± 0.0065 |
+
+Level within the error. At batch 3–8 (verify, `-ub 8`) the kernels give the same output as the gemv kernels.
+
+Through the LAN server (build-cpu, DSpark `n_max=3`, `scripts/apitest.sh`, 256 tokens, temperature 0): code 10.40 tok/s, prose 7.02, prompt of 32 tokens at 14.0 tok/s. With thinking on, a short coding request gave 418 thinking tokens at 8.0 tok/s and a 200-token code answer at 10.2 (`docs/media/r820-deepseek-demo.mp4`).
+
+**Not done:** flash attention on the GPU for prompt batches. The tile kernel's support check still rejects sinks, though the kernel applies them since `fattn_sinks_patch.py`, so attention stays on the CPU in build-cuda (~5 s per pp512). Lifting that check would help build-cuda prompts only, and the CPU build already meets the 20 tok/s target.
+
 ## Ideas for cutting the per-token weight read (2026-10-30)
 
 At dq6k each token reads ~10.9 GB: experts 4.5, dense 6.1, f32 router/hc 0.3. That is ~98 ms at 110 GB/s. They are listed best first.
@@ -816,9 +884,9 @@ Decode tok/s. The estimates are the ones this plan started with; the measurement
 | NUMA-local engine, CPU only, Q8_0 dense | ~6.5 | 5.94 |
 | NUMA-local engine, CPU only, Q6_K dense (the pick) | – | **6.7–7.0** (5.8 at 16K context) |
 | + dense part on the GPU | ~12 | slower: −2–5% at `-ngl 0`, −16–19% with layers on the GPU; shared expert alone −13% |
-| + speculative decoding (DSpark), code-like output | ~16–19 (with the GPU) | **9.7** (`n_max=3`), **10.2–11.0** (`n_max=4`) |
-| + speculative decoding (DSpark), free prose | | 6.3 |
-| Prompt processing, pp512 | – | 10.8 CPU only, **15.2** build-cuda `-ngl 0` |
+| + speculative decoding (DSpark), code-like output | ~16–19 (with the GPU) | **10.7** (`n_max=3`), **12.3** (`n_max=4`) |
+| + speculative decoding (DSpark), free prose | | 6.5–6.8 |
+| Prompt processing, pp512 | – | **23.9** CPU only, 26.1 build-cuda `-ngl 0` |
 
 - The GPU plan assumed the P2200 would add bandwidth. The CPU kernels doubled in speed instead, and each CPU↔GPU hand-off in ggml costs 100–165 µs, so offloading anything per token now loses.
 - Speculative decoding gives ×1.45–1.6 on code, about what Phase 4 expected. On prose the draft is accepted too rarely to gain.
