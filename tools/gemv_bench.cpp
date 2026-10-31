@@ -1,5 +1,5 @@
-// Correctness and bandwidth test for ik_llama/iqk_avx1_gemv.h.
-//   g++ -O3 -march=native -std=c++17 -pthread -I../ik_llama gemv_bench.cpp -o gemv_bench
+// Correctness and bandwidth test for ik_llama/parts/iqk_avx1_gemv.h.
+//   g++ -O3 -march=native -std=c++17 -pthread -I../ik_llama/parts gemv_bench.cpp -o gemv_bench
 //   ./gemv_bench <q8_0|mxfp4|iq4_nl|q6_K> <ny> <threads per node> <nodes> [MiB per node] [n]
 // Each node gets its own weight matrix (first-touched by a thread on that node) and threads pinned to its CPUs.
 #include "iqk_avx1_gemv.h"

@@ -185,7 +185,7 @@ llama-bench decode, Q8_0 dense weights (~12.7 GB/token), tmpfs on 4 KiB pages (`
       3. `is_pascal_hs512` → `ggml_cuda_flash_attn_ext_tile_new`, the Gemma-4 kernel, which **has no attention-sink support** (never reads `src[4]`).
       So every short-context GPU attention drops the per-head `attn_sinks`, decode included; the coherent decode text was luck. Sparse indices are also only turned into a mask when no mask exists.
     - Workaround to test: `-nkvo`, keeping the KV cache and the attention op on the CPU and only the projections on the GPU.
-    - Proper fix (custom kernel, `ik_llama/fattn_sinks_patch.py`, written but not yet compiled or tested): sinks in `tile_new`'s online softmax. Seed each head's running max with its sink logit and the running sum with 1 (exp(sink − max) after rescaling).
+    - Proper fix (custom kernel, `ik_llama/parts/fattn_sinks_patch.py`, now applied, see above): sinks in `tile_new`'s online softmax. Seed each head's running max with its sink logit and the running sum with 1 (exp(sink − max) after rescaling).
 
 ## Phase 3e: attention, small ops and the dense format (2026-10-30)
 
@@ -296,7 +296,7 @@ An earlier split-K-only version, without the node-local copy, was also slower.
 
 ## Smart expert reduction (`-ser`), measured (2026-10-30)
 
-In this tree `-ser` did nothing: the call was commented out. `ik_llama/ser_patch.py` turns it back on, with three changes:
+In this tree `-ser` did nothing: the call was commented out. `ik_llama/parts/ser_patch.py` turns it back on, with three changes:
 - a top-k selection in place of the bubble sort;
 - the threshold applied to the unbiased weights;
 - zero-weight slots skipped when the expert outputs are summed.
@@ -472,7 +472,7 @@ KLD against the BF16-dense model (16 × 256 tokens of wikitext-2), decode on bui
 The shared expert (0.15 GB of Q6_K per token) is the one dense FFN piece small enough to keep on the P2200 while every layer stays on the CPU: `-ngl 0 -ot shexp=CUDA0`, build-cuda, dq6k.
 
 - ik dropped all `-ot` overrides at `-ngl 0`. The patch now keeps them when a GPU is present (`src/llama.cpp`), so single tensors can go to the GPU with no layers offloaded.
-- ggml's scheduler copies a split's inputs before running any of it, so the CPU waits for the GPU's result before starting the routed experts. `ik_llama/sched_defer_patch.py` (not applied) runs a CPU split up to the first node that needs a device result, then copies it in: the routed experts and the GPU's shared expert run side by side.
+- ggml's scheduler copies a split's inputs before running any of it, so the CPU waits for the GPU's result before starting the routed experts. `ik_llama/experiments/sched_defer_patch.py` (not applied) runs a CPU split up to the first node that needs a device result, then copies it in: the routed experts and the GPU's shared expert run side by side.
 
 | Setting | tg32 | tg32 after 512 |
 |---|---|---|
@@ -564,8 +564,8 @@ What is left of the kernel is close to the port's floor (~19 multiplies per 128 
 
 A per-node trace (`GGML_OP_PROF=3`) of the batch-4 graph showed two ops that split their work by token, so 4 tokens kept 4 of 64 threads busy:
 
-- **HC_POST** (the hyper-connection output mix, 80 per graph): 15.4 ms per graph for ~1.2 ms of work. It now splits by (token, 64-element chunk), as the one-token path already did, and every element is computed as before. 15.4 → 6.1 ms. `ik_llama/hc_post_patch.py`, `GGML_HC_POST_SPLIT=0` off.
-- **The copy before `attn_wo_a`** (`dup_bytes`, permuted attention output, 512 KB at 4 tokens) split by dim-1 rows only. It now splits all rows when there are fewer dim-1 rows than threads. CONT 8.5 → 3.4 ms. `ik_llama/dup_rows_patch.py`.
+- **HC_POST** (the hyper-connection output mix, 80 per graph): 15.4 ms per graph for ~1.2 ms of work. It now splits by (token, 64-element chunk), as the one-token path already did, and every element is computed as before. 15.4 → 6.1 ms. `ik_llama/parts/hc_post_patch.py`, `GGML_HC_POST_SPLIT=0` off.
+- **The copy before `attn_wo_a`** (`dup_bytes`, permuted attention output, 512 KB at 4 tokens) split by dim-1 rows only. It now splits all rows when there are fewer dim-1 rows than threads. CONT 8.5 → 3.4 ms. `ik_llama/parts/dup_rows_patch.py`.
 
 `llama-bench`, `GGML_HC_POST_SPLIT` 0 vs 1 (two runs each, tok/s):
 
@@ -580,7 +580,7 @@ With a few tokens the RMS norm before each mix is split along K (`norm_split_pat
 
 At first this made one token slower, because 3/4 of each thread's weight slice sat on other nodes (rows were placed by row quarters). These weights (f32, < 64 rows, ≥ 4096 columns) are now placed by column quarters instead.
 
-`ik_llama/kslice_patch.py`, `GGML_MUL_MAT_KSLICE=0` off. `mmcheck` (`MMCHECK_F32=1`) shows errors of ~4e-9 against the double-precision reference, lower than the row split's.
+`ik_llama/parts/kslice_patch.py`, `GGML_MUL_MAT_KSLICE=0` off. `mmcheck` (`MMCHECK_F32=1`) shows errors of ~4e-9 against the double-precision reference, lower than the row split's.
 
 | | off | on |
 |---|---|---|
@@ -737,7 +737,7 @@ Unsloth UD-Q8_K_XL: 474 GiB in 9 shards (SHA256 verified on the NAS), at `nas.lo
 - **~20 GB read per token as downloaded**, of which 15.5 GB is BF16 dense weights. The earlier "~5–8 GB" estimate assumed those were Q8; they're BF16.
 - **All the BF16 weights are in the last shard (00009, 16.8 GB).** Requantizing them only means rewriting that one file: Q8_0 makes it ~8.2 GB per token (~12.7 GB per token in all), Q4_K-class ~4.4 GB (~8.9 in all). The expert and Engram shards stay as they are.
 - **The experts are already 4-bit.** Requantizing them to Q4_K would not shrink them.
-- **MXFP8** (OCP microscaling: 32 E4M3 values with one E8M0 scale) is not in mainline llama.cpp or ik. It comes from the unmerged llama.cpp PR #30817, which Unsloth's guide builds from. Ported as a gather-only type with `ik_llama/mxfp8_patch.py` (to_float + GET_ROWS), and applied to both trees. The decoder is verified exact for all 256 codes; sampled Engram rows decode cleanly (RMS 0.88, max 5, no NaN).
+- **MXFP8** (OCP microscaling: 32 E4M3 values with one E8M0 scale) is not in mainline llama.cpp or ik. It comes from the unmerged llama.cpp PR #30817, which Unsloth's guide builds from. Ported as a gather-only type with `ik_llama/parts/mxfp8_patch.py` (to_float + GET_ROWS), and applied to both trees. The decoder is verified exact for all 256 codes; sampled Engram rows decode cleanly (RMS 0.88, max 5, no NaN).
 - **DSpark:** the metadata describes it (block size 5, 128 experts, 3 active), but the drafter weights are not in this download.
 
 Decode speed ≈ usable bandwidth ÷ bytes per token. **The BF16 dense weights are now the biggest lever**: 15.5 of the 20 GB per token.

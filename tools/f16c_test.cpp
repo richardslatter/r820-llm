@@ -1,5 +1,5 @@
-// Exhaustive check of ik_llama/iqk_avx1_f16c.h against scalar references.
-//   g++ -O2 -march=native -I../ik_llama f16c_test.cpp -o f16c_test && ./f16c_test
+// Exhaustive check of ik_llama/parts/iqk_avx1_f16c.h against scalar references.
+//   g++ -O2 -march=native -I../ik_llama/parts f16c_test.cpp -o f16c_test && ./f16c_test
 #include "iqk_avx1_f16c.h"
 
 #include <cmath>
