@@ -113,7 +113,7 @@ func frame(_ ft: Double) {
 
     // header
     draw(ctx, "DeepSeek V4.1 Flash  ·  552B MoE", uiB, cText, marginX, 52)
-    draw(ctx, "Dell PowerEdge R820 (2012)  ·  4× Xeon E5-4640, AVX1 only  ·  CPU only  ·  DSpark draft", ui, cDim, marginX, 88)
+    draw(ctx, "Dell PowerEdge R820 (2012)  ·  4× Xeon E5-4640, AVX1 only  ·  decode on the CPU, P2200 for prompts  ·  DSpark draft", ui, cDim, marginX, 88)
     let rt = "real-time recording"
     draw(ctx, rt, ui, cAccent, CGFloat(W) - marginX - width(rt, ui), 52)
     ctx.setFillColor(border); ctx.fill(CGRect(x: 0, y: H - 112, width: W, height: 1))

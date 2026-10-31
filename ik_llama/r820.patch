@@ -95,6 +95,19 @@ index bb8c5087..3664bc8b 100644
  
  option(GGML_CUDA                            "ggml: use CUDA"                                  OFF)
  option(GGML_MUSA                            "ggml: use MUSA"                                  OFF)
+diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
+index 7920bc5a..c8a18265 100644
+--- a/ggml/include/ggml-cuda.h
++++ b/ggml/include/ggml-cuda.h
+@@ -41,6 +41,8 @@ GGML_API GGML_CALL bool ggml_backend_cuda_is_integrated(int device);
+ 
+ GGML_API GGML_CALL bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
+ GGML_API GGML_CALL void ggml_backend_cuda_unregister_host_buffer(void * buffer);
++// pins without the GGML_CUDA_REGISTER_HOST check
++GGML_API GGML_CALL bool ggml_backend_cuda_pin_host_buffer(void * buffer, size_t size);
+ 
+ GGML_API GGML_CALL void ggml_backend_cuda_log_set_callback(ggml_log_callback log_callback, void * user_data);
+ 
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
 index 9de1c761..0e9a2949 100644
 --- a/ggml/include/ggml.h
@@ -135,10 +148,23 @@ index 486c4440..75207eee 100644
          message(STATUS "Enabling IQK Flash Attention kernels")
          add_compile_definitions(GGML_IQK_FLASH_ATTENTION)
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index d2a74454..95f40491 100644
+index d2a74454..c6cce9a1 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
-@@ -2072,6 +2072,11 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
+@@ -1369,8 +1369,10 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
+         if (src == NULL) {
+             continue;
+         }
+-        if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+-            int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
++        // a view of a weight (e.g. a reshaped weight) gets its buffer only when the graph is allocated
++        const struct ggml_tensor * ws = src->buffer == NULL && src->view_src != NULL ? src->view_src : src;
++        if (ws->buffer != NULL && ws->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
++            int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, ws, tensor);
+             // check if a backend with higher prio wants to offload the op
+             if (offload_enabled && src_backend_id == sched->n_backends - 1) {
+                 for (int b = 0; b < src_backend_id; b++) {
+@@ -2072,6 +2074,11 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                  }
                  synced_on_input = true;
              }
@@ -169,8 +195,45 @@ index 434aad15..9664fe68 100644
  typedef struct {
      uint8_t e[8]; // E8M0
      uint8_t qs[4*QK_MXFP4];
+diff --git a/ggml/src/ggml-cuda.cu b/ggml/src/ggml-cuda.cu
+index 9cc01e9e..8cbe78f6 100644
+--- a/ggml/src/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda.cu
+@@ -5361,6 +5361,10 @@ GGML_CALL static bool ggml_backend_cuda_offload_op(ggml_backend_t backend, const
+         return should_offload;
+     }
+ 
++    if (op->op == GGML_OP_FLASH_ATTN_EXT) {
++        return op->src[0]->ne[1] >= min_batch_size;
++    }
++
+     return op->ne[1] >= min_batch_size && op->op != GGML_OP_GET_ROWS;
+ 
+     // Original:
+@@ -5673,6 +5677,21 @@ GGML_CALL bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size
+ #endif
+ }
+ 
++GGML_CALL bool ggml_backend_cuda_pin_host_buffer(void * buffer, size_t size) {
++    // read-only mappings need the ReadOnly flag where the device supports it
++    cudaError_t err = cudaHostRegister(buffer, size, cudaHostRegisterPortable | cudaHostRegisterReadOnly);
++    if (err != cudaSuccess) {
++        cudaGetLastError();
++        err = cudaHostRegister(buffer, size, cudaHostRegisterPortable);
++    }
++    if (err != cudaSuccess) {
++        cudaGetLastError();
++        GGML_CUDA_LOG_WARN("%s: failed to pin %.2f MiB: %s\n", __func__, size / 1024.0 / 1024.0, cudaGetErrorString(err));
++        return false;
++    }
++    return true;
++}
++
+ GGML_CALL void ggml_backend_cuda_unregister_host_buffer(void * buffer) {
+     if (getenv("GGML_CUDA_REGISTER_HOST") == nullptr) {
+         return;
 diff --git a/ggml/src/ggml-cuda/fattn-tile-new.cu b/ggml/src/ggml-cuda/fattn-tile-new.cu
-index ecca1604..a92c74e5 100644
+index ecca1604..5b487a85 100644
 --- a/ggml/src/ggml-cuda/fattn-tile-new.cu
 +++ b/ggml/src/ggml-cuda/fattn-tile-new.cu
 @@ -398,6 +398,7 @@ static __global__ void flash_attn_tile_new(
@@ -215,6 +278,19 @@ index ecca1604..a92c74e5 100644
          KV_max.get(),
          parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
          scale, 0.0f, 1.0f, 1.0f, 0.0f, 1u,
+@@ -848,7 +869,11 @@ bool ggml_cuda_fattn_tile_new_is_supported(ggml_backend_cuda_context & ctx, cons
+     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+ 
+     // Only the variants that pack 4 or 8 Q heads per K/V head are compiled. Everything else stays on the CPU.
+-    if (K->ne[0] != 512 || V->ne[0] != 512 || !mask || sinks || max_bias != 0.0f || logit_softcap != 0.0f) {
++    if (K->ne[0] != 512 || V->ne[0] != 512 || !mask || max_bias != 0.0f || logit_softcap != 0.0f) {
++        return false;
++    }
++    // Sinks are applied by the kernel: one f32 per Q head.
++    if (sinks && (sinks->type != GGML_TYPE_F32 || sinks->ne[0] != Q->ne[2])) {
+         return false;
+     }
+     if (K->ne[1] % FATTN_KQ_STRIDE != 0 || Q->ne[3] != 1 || Q->ne[2] % K->ne[2] != 0 || (Q->ne[2] / K->ne[2]) % 4 != 0) {
 diff --git a/ggml/src/ggml-quants.c b/ggml/src/ggml-quants.c
 index 0c5918a5..bd6ec076 100644
 --- a/ggml/src/ggml-quants.c
@@ -272,7 +348,7 @@ index 1e266581..e2c0b072 100644
  void dequantize_row_q6_0(const block_q6_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
  
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 368bc5e5..25060937 100644
+index 368bc5e5..ad77039c 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -38,6 +38,11 @@
@@ -1082,7 +1158,7 @@ index 368bc5e5..25060937 100644
          for (int64_t j = 0; j < ne0; j++) {
              dst_data[j] = j;
          }
-@@ -23514,6 +23857,427 @@ static void ggml_compute_forward_grouped_topk(
+@@ -23514,6 +23857,460 @@ static void ggml_compute_forward_grouped_topk(
  
  // ggml_compute_forward_flash_attn_ext
  
@@ -1099,7 +1175,7 @@ index 368bc5e5..25060937 100644
 +    const struct ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2];
 +    if (q->ne[1] > 8 || k->ne[2] != 1 || v->ne[2] != 1 || q->ne[3] != 1) return 0;
 +    const size_t H = q->ne[2], Dk = k->ne[0], Dv = v->ne[0], nkv = k->ne[1];
-+    return 16 + q->ne[1]*8*H*(Dv + 16) + (size_t)nth*GGML_PAD(GGML_FA_MQA_BR*(Dk + Dv) + 2*H*GGML_FA_MQA_BR + 2*nkv + 64, 16);
++    return 16 + q->ne[1]*8*H*(Dv + 16) + (size_t)nth*GGML_PAD(GGML_FA_MQA_BR*(Dk + Dv) + 2*H*GGML_FA_MQA_BR + (q->ne[1] + 1)*nkv + 64, 16);
 +}
 +
 +// whether ggml_fa_mqa_decode takes this node (it also needs the work buffer of ggml_fa_mqa_work_floats)
@@ -1351,13 +1427,13 @@ index 368bc5e5..25060937 100644
 +    // 64-byte aligned: the state of a head is Dv accumulators, max, sum, padding to SD floats
 +    const int64_t SD = Dv + 16;
 +    float * part    = (float *)(((uintptr_t) params->wdata + 63) & ~(uintptr_t) 63);
-+    float * scratch = part + NQ*8*H*SD + (size_t)ith*GGML_PAD(BR*(Dk + Dv) + 2*H*BR + 2*nkv + 64, 16);
++    float * scratch = part + NQ*8*H*SD + (size_t)ith*GGML_PAD(BR*(Dk + Dv) + 2*H*BR + (NQ + 1)*nkv + 64, 16);
 +    float * Kt   = scratch;
 +    float * Vt   = Kt + BR*Dk;
 +    float * P    = Vt + BR*Dv;
 +    float * corr = P + H*BR;
 +    float * mvs  = corr + H*BR;
-+    int32_t * rows = (int32_t *)(mvs + nkv);
++    int32_t * rows = (int32_t *)(mvs + NQ*nkv);
 +
 +    // the same chunking on every thread: by the number of visible rows of query 0
 +    int64_t n0 = 0;
@@ -1370,9 +1446,14 @@ index 368bc5e5..25060937 100644
 +    } else {
 +        n0 = nkv;
 +    }
-+    // chunks of >= 64 rows, at most 8 (more chunks: fewer conversions per row, more merging)
++    // chunks of >= min_rows rows, at most 8 (more chunks: fewer conversions per row, more merging)
++    static int min_rows = -1;
++    if (min_rows < 0) {
++        const char * e = getenv("GGML_FA_MQA_MINROWS");
++        min_rows = e ? MAX(1, atoi(e)) : 64;
++    }
 +    int C = 1;
-+    while (2*C <= 8 && 2*C <= nth && nth % (2*C) == 0 && n0 >= 64*C) C *= 2;
++    while (2*C <= 8 && 2*C <= nth && nth % (2*C) == 0 && n0 >= min_rows*C) C *= 2;
 +    const int G = nth / C;
 +    // consecutive threads share a chunk: with GGML_NUMA_BLOCKED a node then reads only the rows
 +    // of its own chunks (once from memory, then from its L3 for the other head groups)
@@ -1381,17 +1462,32 @@ index 368bc5e5..25060937 100644
 +    const bool kv_same = k->data == v->data && k->nb[1] == v->nb[1] && Dk == Dv;
 +    const int64_t h0 = H*g/G, h1 = H*(g + 1)/G;
 +
-+    for (int64_t iq1 = 0; iq1 < NQ; ++iq1) {
-+        // visible rows of this query and their mask values
++    // With a mask, the queries go through the rows together: the rows any of them sees, with -inf
++    // for a query that does not see a row. Each block of rows is then converted once for all of
++    // them, not once per query (the verify batch of speculative decoding sees nearly the same rows).
++    static int multi = -1;
++    if (multi < 0) {
++        const char * e = getenv("GGML_FA_MQA_MULTI");
++        multi = !e || atoi(e) != 0;
++    }
++    const int64_t nqp = mask && multi ? NQ : 1;
++
++    for (int64_t iq = 0; iq < NQ; iq += nqp) {
++        // rows of this pass, and the mask value of each of its queries on them (mvs + a*nkv)
 +        int64_t n = 0;
 +        if (mask) {
-+            const uint16_t * mp = (const uint16_t *)((const char *) mask->data + iq1*mask->nb[1]);
++            const uint16_t * mq[8];
++            for (int64_t a = 0; a < nqp; ++a) mq[a] = (const uint16_t *)((const char *) mask->data + (iq + a)*mask->nb[1]);
 +            for (int64_t i = 0; i < nkv; ++i) {
-+                if (mp[i] == 0xfc00) continue;
-+                rows[n] = (int32_t) i; mvs[n] = GGML_FP16_TO_FP32(mp[i]); ++n;
++                int vis = 0;
++                for (int64_t a = 0; a < nqp; ++a) vis |= mq[a][i] != 0xfc00;
++                if (!vis) continue;
++                rows[n] = (int32_t) i;
++                for (int64_t a = 0; a < nqp; ++a) mvs[a*nkv + n] = mq[a][i] == 0xfc00 ? -INFINITY : GGML_FP16_TO_FP32(mq[a][i]);
++                ++n;
 +            }
 +        } else if (idx) {
-+            const int32_t * ip = (const int32_t *)((const char *) idx->data + iq1*idx->nb[1]);
++            const int32_t * ip = (const int32_t *)((const char *) idx->data + iq*idx->nb[1]);
 +            for (int64_t i = 0; i < idx->ne[0]; ++i) {
 +                if (ip[i] < 0) continue;
 +                rows[n] = ip[i]; mvs[n] = 0.0f; ++n;
@@ -1401,14 +1497,15 @@ index 368bc5e5..25060937 100644
 +        }
 +        const int64_t r0 = n*c/C, r1 = n*(c + 1)/C;
 +
-+        // state of head h: Dv accumulators, running max, running sum
-+        float * st0 = part + (iq1*C + c)*H*SD;
-+        for (int64_t h = h0; h < h1; ++h) {
-+            float * st = st0 + h*SD;
-+            memset(st, 0, Dv*sizeof(float));
-+            st[Dv] = -INFINITY; st[Dv + 1] = 0.0f;
++        // state of head h of query iq + a: Dv accumulators, running max, running sum
++        for (int64_t a = 0; a < nqp; ++a) {
++            float * st0 = part + ((iq + a)*C + c)*H*SD;
++            for (int64_t h = h0; h < h1; ++h) {
++                float * st = st0 + h*SD;
++                memset(st, 0, Dv*sizeof(float));
++                st[Dv] = -INFINITY; st[Dv + 1] = 0.0f;
++            }
 +        }
-+        const float * q0 = (const float *)((const char *) q->data + iq1*q->nb[1]);
 +
 +        for (int64_t rb = r0; rb < r1; rb += BR) {
 +            const int nb = (int) MIN(BR, r1 - rb), nb4 = (nb + 3) & ~3;
@@ -1422,42 +1519,54 @@ index 368bc5e5..25060937 100644
 +            }
 +            const float * Vr = kv_same ? Kt : Vt;
 +
-+            // raw scores, P[(h - h0)*BR + j]
-+            int64_t h = h0;
-+            for (; h + 2 <= h1; h += 2) {
-+                const float * qa = (const float *)((const char *) q0 + h*q->nb[2]);
-+                const float * qb = (const float *)((const char *) q0 + (h + 1)*q->nb[2]);
-+                for (int j = 0; j < nb4; j += 4) {
-+                    ggml_fa_qk_2x4(qa, qb, Kt + j*Dk, Dk, P + (h - h0)*BR + j, P + (h + 1 - h0)*BR + j);
-+                }
-+            }
-+            for (; h < h1; ++h) {
-+                const float * qa = (const float *)((const char *) q0 + h*q->nb[2]);
-+                for (int j = 0; j < nb4; j += 4) ggml_fa_qk_1x4(qa, Kt + j*Dk, Dk, P + (h - h0)*BR + j);
-+            }
++            for (int64_t a = 0; a < nqp; ++a) {
++                const float * q0  = (const float *)((const char *) q->data + (iq + a)*q->nb[1]);
++                const float * mv  = mvs + a*nkv + rb;
++                float       * st0 = part + ((iq + a)*C + c)*H*SD;
 +
-+            // online softmax: new max, the factor for the old accumulators, probabilities
-+            for (h = h0; h < h1; ++h) {
-+                float * p  = P + (h - h0)*BR;
-+                float * st = st0 + h*SD;
-+                float mx = -INFINITY;
-+                for (int j = 0; j < nb; ++j) {
-+                    const float s = softcap == 0.0f ? p[j]*scale + mvs[rb + j] : softcap*tanhf(p[j]*scale) + mvs[rb + j];
-+                    p[j] = s; mx = MAX(mx, s);
++                // raw scores, P[(h - h0)*BR + j]
++                int64_t h = h0;
++                for (; h + 2 <= h1; h += 2) {
++                    const float * qa = (const float *)((const char *) q0 + h*q->nb[2]);
++                    const float * qb = (const float *)((const char *) q0 + (h + 1)*q->nb[2]);
++                    for (int j = 0; j < nb4; j += 4) {
++                        ggml_fa_qk_2x4(qa, qb, Kt + j*Dk, Dk, P + (h - h0)*BR + j, P + (h + 1 - h0)*BR + j);
++                    }
 +                }
-+                const float M = MAX(st[Dv], mx);
-+                const float cf = st[Dv] == -INFINITY ? 0.0f : expf(st[Dv] - M);
-+                float S = st[Dv + 1]*cf;
-+                for (int j = 0; j < nb; ++j) { p[j] = expf(p[j] - M); S += p[j]; }
-+                corr[h - h0] = cf; st[Dv] = M; st[Dv + 1] = S;
-+            }
++                for (; h < h1; ++h) {
++                    const float * qa = (const float *)((const char *) q0 + h*q->nb[2]);
++                    for (int j = 0; j < nb4; j += 4) ggml_fa_qk_1x4(qa, Kt + j*Dk, Dk, P + (h - h0)*BR + j);
++                }
 +
-+            // accumulators: o_h = o_h*corr_h + sum_j p_h[j]*V[j]
-+            for (h = h0; h + 4 <= h1; h += 4) {
-+                ggml_fa_pv_4(st0 + h*SD, SD, P + (h - h0)*BR, corr + (h - h0), Vr, Dv, nb);
-+            }
-+            for (; h < h1; ++h) {
-+                ggml_fa_pv_1(st0 + h*SD, P + (h - h0)*BR, corr[h - h0], Vr, Dv, nb);
++                // online softmax: new max, the factor for the old accumulators, probabilities
++                for (h = h0; h < h1; ++h) {
++                    float * p  = P + (h - h0)*BR;
++                    float * st = st0 + h*SD;
++                    float mx = -INFINITY;
++                    for (int j = 0; j < nb; ++j) {
++                        const float s = softcap == 0.0f ? p[j]*scale + mv[j] : softcap*tanhf(p[j]*scale) + mv[j];
++                        p[j] = s; mx = MAX(mx, s);
++                    }
++                    const float M = MAX(st[Dv], mx);
++                    if (M == -INFINITY) {
++                        // nothing visible yet: leave the state as it is
++                        for (int j = 0; j < nb; ++j) p[j] = 0.0f;
++                        corr[h - h0] = 1.0f;
++                        continue;
++                    }
++                    const float cf = st[Dv] == -INFINITY ? 0.0f : expf(st[Dv] - M);
++                    float S = st[Dv + 1]*cf;
++                    for (int j = 0; j < nb; ++j) { p[j] = expf(p[j] - M); S += p[j]; }
++                    corr[h - h0] = cf; st[Dv] = M; st[Dv + 1] = S;
++                }
++
++                // accumulators: o_h = o_h*corr_h + sum_j p_h[j]*V[j]
++                for (h = h0; h + 4 <= h1; h += 4) {
++                    ggml_fa_pv_4(st0 + h*SD, SD, P + (h - h0)*BR, corr + (h - h0), Vr, Dv, nb);
++                }
++                for (; h < h1; ++h) {
++                    ggml_fa_pv_1(st0 + h*SD, P + (h - h0)*BR, corr[h - h0], Vr, Dv, nb);
++                }
 +            }
 +        }
 +    }
@@ -1510,7 +1619,7 @@ index 368bc5e5..25060937 100644
  static void ggml_compute_forward_flash_attn_ext_f16(
          const struct ggml_compute_params * params,
          struct ggml_tensor * dst) {
-@@ -23533,6 +24297,10 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+@@ -23533,6 +24330,10 @@ static void ggml_compute_forward_flash_attn_ext_f16(
      GGML_TENSOR_LOCALS(int64_t, ne,  dst, ne)
      GGML_TENSOR_LOCALS(size_t,  nb,  dst, nb)
  
@@ -1521,7 +1630,7 @@ index 368bc5e5..25060937 100644
      const int ith = params->ith;
      const int nth = params->nth;
  
-@@ -25116,46 +25884,28 @@ static void ggml_compute_forward_hc_post_f32(
+@@ -25116,46 +25917,28 @@ static void ggml_compute_forward_hc_post_f32(
      //    return;
      //}
  
@@ -1586,7 +1695,7 @@ index 368bc5e5..25060937 100644
              for (int j = 0; j < S; ++j) {
                  const float * res_r  = (const float *)((const char *)res->data + t*res->nb[2] + j*res->nb[1]);
                  r[j] = res_r[i0];
-@@ -25163,7 +25913,6 @@ static void ggml_compute_forward_hc_post_f32(
+@@ -25163,7 +25946,6 @@ static void ggml_compute_forward_hc_post_f32(
              for (int i = 0; i < S; ++i) {
                  float sum = x_r[i0] * post_r[i];
                  for (int j = 0; j < S; ++j) {
@@ -1594,7 +1703,7 @@ index 368bc5e5..25060937 100644
                      sum += comb_r[j*S + i] * r[j];
                  }
                  float * dst_r = (float *)((char *)dst->data + t*dst->nb[2] + i*dst->nb[1]);
-@@ -29188,7 +29937,7 @@ typedef int ggml_lock_t;
+@@ -29188,7 +29970,7 @@ typedef int ggml_lock_t;
  
  // Android's libc implementation "bionic" does not support setting affinity
  #if defined(__gnu_linux__)
@@ -1603,7 +1712,7 @@ index 368bc5e5..25060937 100644
      if (!ggml_is_numa()) {
          return;
      }
-@@ -29200,7 +29949,8 @@ static void set_numa_thread_affinity(int thread_n) {
+@@ -29200,7 +29982,8 @@ static void set_numa_thread_affinity(int thread_n) {
      switch(g_state.numa.numa_strategy) {
          case GGML_NUMA_STRATEGY_DISTRIBUTE:
              // run thread on node_num thread_n / (threads per node)
@@ -1613,7 +1722,7 @@ index 368bc5e5..25060937 100644
              break;
          case GGML_NUMA_STRATEGY_ISOLATE:
              // run thread on current_node
-@@ -29221,8 +29971,15 @@ static void set_numa_thread_affinity(int thread_n) {
+@@ -29221,8 +30004,15 @@ static void set_numa_thread_affinity(int thread_n) {
  
      cpu_set_t * cpus = CPU_ALLOC(g_state.numa.total_cpus);
      CPU_ZERO_S(setsize, cpus);
@@ -1631,7 +1740,7 @@ index 368bc5e5..25060937 100644
      }
  
      rv = pthread_setaffinity_np(pthread_self(), setsize, cpus);
-@@ -29233,6 +29990,57 @@ static void set_numa_thread_affinity(int thread_n) {
+@@ -29233,6 +30023,57 @@ static void set_numa_thread_affinity(int thread_n) {
      CPU_FREE(cpus);
  }
  
@@ -1689,7 +1798,7 @@ index 368bc5e5..25060937 100644
  static void clear_numa_thread_affinity(void) {
      if (!ggml_is_numa()) {
          return;
-@@ -29286,7 +30094,8 @@ static void set_cpu_thread_affinity(const struct ggml_cplan * cplan, int thread_
+@@ -29286,7 +30127,8 @@ static void set_cpu_thread_affinity(const struct ggml_cplan * cplan, int thread_
  #else
  // TODO: Windows etc.
  // (the linux implementation may also work on BSD, someone should test)
@@ -1699,7 +1808,7 @@ index 368bc5e5..25060937 100644
  static void clear_numa_thread_affinity(void) {}
  static void set_cpu_thread_affinity(const struct ggml_cplan * cplan, int thread_n) { UNUSED(cplan); UNUSED(thread_n); }
  #endif
-@@ -29563,6 +30372,8 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
+@@ -29563,6 +30405,8 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
  
      int max_tasks = 1;
  
@@ -1708,7 +1817,7 @@ index 368bc5e5..25060937 100644
      // thread scheduling for the different operations + work buffer size estimation
      for (int i = 0; i < cgraph->n_nodes; i++) {
          struct ggml_tensor * node = cgraph->nodes[i];
-@@ -29608,6 +30419,7 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
+@@ -29608,6 +30452,7 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
                              cur += n_tasks*node->src[1]->ne[0]*sizeof(float); // src1->type -> f32 -> vec_dot_type
                          }
                      }
@@ -1716,7 +1825,7 @@ index 368bc5e5..25060937 100644
                  } break;
              case GGML_OP_MUL_MAT_ID:
                  {
-@@ -29716,6 +30528,7 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
+@@ -29716,6 +30561,7 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
                      size_t size = iqk_fa_work_buffer_size(node, n_tasks);
                      cur = MAX(cur, size);
  #endif
@@ -1724,7 +1833,7 @@ index 368bc5e5..25060937 100644
                  } break;
              case GGML_OP_LATENT_ATTN:
                  {
-@@ -29766,6 +30579,11 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
+@@ -29766,6 +30612,11 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
                  {
                      cur = ggml_type_size(node->type)*(n_tasks + node->src[0]->ne[0]*n_tasks);
                  } break;
@@ -1736,7 +1845,7 @@ index 368bc5e5..25060937 100644
              case GGML_OP_COUNT:
                  {
                      GGML_ABORT("fatal error");
-@@ -29788,14 +30606,97 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
+@@ -29788,14 +30639,97 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
      return cplan;
  }
  
@@ -1829,13 +1938,13 @@ index 368bc5e5..25060937 100644
 +    if (state->shared->hb_n_nodes > 1) {
 +        g_hb_node = state->ith*state->shared->hb_n_nodes/state->shared->n_threads;
 +    }
-+    // GGML_OP_PROF=2: decode-sized graphs (<= 8 tokens) only, =4: graphs of <= 1000 nodes (e.g. a draft model)
-+    const bool prof = g_prof_on > 0 && state->shared->n_threads <= 512 && (g_prof_on == 1 || state->shared->n_batch <= 8) && (g_prof_on != 4 || cgraph->n_nodes <= 1000);
++    // GGML_OP_PROF=2: decode-sized graphs (<= 8 tokens) only, =4: graphs of <= 1000 nodes (e.g. a draft model), =5: decode-sized graphs of > 1000 nodes (the target)
++    const bool prof = g_prof_on > 0 && state->shared->n_threads <= 512 && (g_prof_on == 1 || state->shared->n_batch <= 8) && (g_prof_on != 4 || cgraph->n_nodes <= 1000) && (g_prof_on != 5 || cgraph->n_nodes > 1000);
 +    if (prof && state->ith == 0) g_prof_graphs++;
  
      struct ggml_compute_params params = {
          /*.ith   =*/ state->ith,
-@@ -29818,7 +30719,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -29818,7 +30752,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
  #if IK_PRINT_TIMING
          int64_t tim1 = ggml_time_us();
  #endif
@@ -1845,7 +1954,7 @@ index 368bc5e5..25060937 100644
  #if IK_PRINT_TIMING
          int64_t tim2 = ggml_time_us();
          t_eval += tim2 - tim1;
-@@ -29830,6 +30733,40 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -29830,6 +30766,43 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
  
          ggml_barrier(state->shared);
  
@@ -1883,10 +1992,13 @@ index 368bc5e5..25060937 100644
 +            }
 +        }
 +
++        // keep the other threads from overwriting their time with the next node's before it is read
++        if (prof) ggml_barrier(state->shared);
++
          if (state->shared->ec != GGML_STATUS_SUCCESS) {
              break;
          }
-@@ -29849,6 +30786,16 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+@@ -29849,6 +30822,16 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
  
      int n_threads = cplan->n_threads;
  
@@ -1903,7 +2015,7 @@ index 368bc5e5..25060937 100644
  #if defined(__gnu_linux__)
      // the calling thread is worker 0 and gets pinned below; remember its affinity
      cpu_set_t saved_affinity;
-@@ -29882,6 +30829,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+@@ -29882,6 +30865,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                  // update the number of threads from the actual number of threads that we got from OpenMP
                  n_threads = omp_get_num_threads();
                  state_shared.n_threads = n_threads;
@@ -1911,7 +2023,7 @@ index 368bc5e5..25060937 100644
              }
  
              struct ggml_compute_state worker = {
-@@ -29905,6 +30853,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+@@ -29905,6 +30889,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
      }
  #else
      struct ggml_compute_state * workers = alloca(sizeof(struct ggml_compute_state)*n_threads);
@@ -3283,10 +3395,10 @@ index 9c95e1aa..92684524 100644
  
  bool llama_model_dflash_io_tensors_match(
 diff --git a/src/llama.cpp b/src/llama.cpp
-index e4e15885..8e6610d0 100644
+index e4e15885..a17004f1 100644
 --- a/src/llama.cpp
 +++ b/src/llama.cpp
-@@ -5418,6 +5418,25 @@ static bool llm_load_tensors(
+@@ -5418,6 +5418,40 @@ static bool llm_load_tensors(
          if (defer_ple_mmap) {
              ml.apply_ple_mmap_policy();
          }
@@ -3309,10 +3421,59 @@ index e4e15885..8e6610d0 100644
 +            LLAMA_LOG_INFO("%s: NUMA-placed %d tensors, %.1f GB, in %.1f s\n", __func__, n_placed,
 +                           placed/1e9, (ggml_time_us() - t0)/1e6);
 +        }
++#ifdef GGML_USE_CUDA
++        // GGML_CUDA_PIN_MAX_GB=<n>: pin the mmapped host buffers of at most n GB (after placement)
++        if (const char * e = getenv("GGML_CUDA_PIN_MAX_GB"); e && n_layer >= n_gpu_layers) {
++            const size_t cap = size_t(atof(e)*1e9);
++            for (ggml_backend_buffer_t buf : model.bufs) {
++                if (ggml_backend_buffer_get_type(buf) != ggml_backend_cpu_buffer_type()) continue;
++                const size_t size = ggml_backend_buffer_get_size(buf);
++                if (size > cap) continue;
++                const int64_t t0 = ggml_time_us();
++                const bool ok = ggml_backend_cuda_pin_host_buffer(ggml_backend_buffer_get_base(buf), size);
++                LLAMA_LOG_INFO("%s: pinned %.2f GB of host weights for the GPU: %s, %.1f s\n", __func__, size/1e9,
++                               ok ? "ok" : "failed", (ggml_time_us() - t0)/1e6);
++            }
++        }
++#endif
  #if defined(_WIN32)
          // Without --defer-ple, fault sparse tables in synchronously (prefetch is best-effort).
          auto touch_host = [](struct ggml_tensor * t) {
-@@ -9120,7 +9139,9 @@ struct llama_model * llama_model_load_from_file(
+@@ -7303,10 +7337,33 @@ static size_t llama_output_reserve(llama_context & lctx, size_t n_outputs) {
+     return llama_output_reserve(lctx, n_outputs, n_outputs, n_outputs);
+ }
+ 
++static int64_t g_decode_trace_compute_us = 0;
++static bool llama_decode_trace() {
++    static const bool on = [] { const char * e = getenv("LLAMA_DECODE_TRACE"); return e && atoi(e) != 0; }();
++    return on;
++}
++
++static void llama_graph_compute_impl(
++        llama_context & lctx,
++          ggml_cgraph * gf,
++                  int   n_threads);
++
+ static void llama_graph_compute(
+         llama_context & lctx,
+           ggml_cgraph * gf,
+                   int   n_threads) {
++    const int64_t t0 = llama_decode_trace() ? ggml_time_us() : 0;
++    llama_graph_compute_impl(lctx, gf, n_threads);
++    if (llama_decode_trace()) {
++        ggml_backend_sched_synchronize(lctx.sched);
++        g_decode_trace_compute_us += ggml_time_us() - t0;
++    }
++}
++
++static void llama_graph_compute_impl(
++        llama_context & lctx,
++          ggml_cgraph * gf,
++                  int   n_threads) {
+ #ifdef GGML_USE_METAL
+     if (ggml_backend_is_metal(lctx.backend_metal)) {
+         ggml_backend_metal_set_n_cb(lctx.backend_metal, n_threads);
+@@ -9120,7 +9177,9 @@ struct llama_model * llama_model_load_from_file(
          params.n_gpu_layers = 0;
      }
      if (params.n_gpu_layers == 0) {
@@ -3323,3 +3484,16 @@ index e4e15885..8e6610d0 100644
          params.ncmoe = 0;
      }
  
+@@ -13454,7 +13513,12 @@ int32_t llama_encode(
+ int32_t llama_decode(
+         struct llama_context * ctx,
+           struct llama_batch   batch) {
++    const int64_t t0 = ggml_time_us(), c0 = g_decode_trace_compute_us;
+     const int ret = llama_decode_internal(*ctx, batch);
++    if (llama_decode_trace()) {
++        fprintf(stderr, "DTRACE t=%lld n=%d L=%d total=%lld compute=%lld\n", (long long) t0, batch.n_tokens,
++                (int) ctx->model.hparams.n_layer, (long long)(ggml_time_us() - t0), (long long)(g_decode_trace_compute_us - c0));
++    }
+     if (ret < 0) {
+         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
+     }

@@ -746,7 +746,68 @@ Level within the error. At batch 3–8 (verify, `-ub 8`) the kernels give the sa
 
 Through the LAN server (build-cpu, DSpark `n_max=3`, `scripts/apitest.sh`, 256 tokens, temperature 0): code 10.40 tok/s, prose 7.02, prompt of 32 tokens at 14.0 tok/s. With thinking on, a short coding request gave 418 thinking tokens at 8.0 tok/s and a 200-token code answer at 10.2 (`docs/media/r820-deepseek-demo.mp4`).
 
-**Not done:** flash attention on the GPU for prompt batches. The tile kernel's support check still rejects sinks, though the kernel applies them since `fattn_sinks_patch.py`, so attention stays on the CPU in build-cuda (~5 s per pp512). Lifting that check would help build-cuda prompts only, and the CPU build already meets the 20 tok/s target.
+**Not done:** flash attention on the GPU for prompt batches. The tile kernel's support check still rejects sinks, though the kernel applies them since `fattn_sinks_patch.py`, so attention stays on the CPU in build-cuda (~5 s per pp512). Lifting that check would help build-cuda prompts only, and the CPU build already meets the 20 tok/s target. *Done in the next section.*
+
+## Second targets: 30 tok/s prompts, 15 tok/s decode (2026-10-31)
+
+### Prompts: 35 tok/s on build-cuda
+
+- **Prompt attention on the GPU** (`fa_offload_patch.py`). With `-ngl 0` an op reaches the GPU only through the scheduler's offload rule (a CPU weight as a source, batch ≥ 32). Attention qualifies through its per-head sinks, but the Pascal hs512 tile kernel still reported sinks as unsupported. Allowing them moves prompt attention to the GPU, next to the projections already there. Decode and the verify batch (< 32 tokens) stay on the CPU. pp512 26.1 → 29.1–29.9.
+- **Pinned dense weights** (`cuda_pin_patch.py`, `GGML_CUDA_PIN_MAX_GB=10`). After NUMA placement (pinned pages cannot move), `cudaHostRegister` the host buffers of at most 10 GB: the dense shard, which large batches upload. The uploads then run at PCIe speed instead of through pageable staging. The expert shards are used on the CPU only and stay unpinned. pp512 → **35.05**, 35.12 ± 0.40 on the final build.
+- Quality of the GPU prompt path (build-cuda `-ngl 0`, `-ub 256`, so attention runs on the GPU, 16 × 256 tokens against BF16): mean KLD 0.0195 ± 0.0015, 99th percentile 0.314, same top token 96.41 ± 0.41%, PPL(Q)/PPL(BF16) 1.0125 ± 0.0058. Level with the CPU path (0.0191–0.0201) within the error.
+- **The server goes back to build-cuda**: prompts 35.1 against 23.9, and decode at `n_max=4` is the same (code 12.28 against 12.29).
+
+Through the LAN server (`scripts/apitest.sh`, 256 tokens, temperature 0):
+
+| Server | code | prose |
+|---|---|---|
+| build-cuda, `n_max=4` (runs now) | 10.09 | 7.01 |
+| build-cuda, `n_max=3` | 9.31 | 6.85 |
+| build-cpu, `n_max=4` | 10.34 | 7.11 |
+
+build-cpu decodes ~2.5% faster, but build-cuda reads prompts 47% faster, so the server runs build-cuda at `n_max=4`. The chat-API code prompt gets ~3 tokens per round (84–87% of drafts accepted, against 93% and 4.68 tokens on the benchmark's code task), which is why it shows ~10 tok/s, not 12. Demo, same prompt as before with thinking on: 832 tokens at 8.98 tok/s (thinking 8.4, code answer 11.3), against 622 at 8.68 (`docs/media/r820-deepseek-demo.mp4`).
+
+### The verify batch: where the time goes
+
+`GGML_OP_PROF=5` on build-cpu, DSpark `n_max=4`, code. The main graph holds layers 0–36; the DSpark eval callback splits layers 37–39 and the output head into separate graphs.
+
+| Part of a 5-token verify | ms | Note |
+|---|---|---|
+| Routed experts (up/gate + down) | 144.5 | 136–140 GB/s: the bandwidth floor |
+| Dense Q6_K (q_a, kv, q_b, wo_a, wo_b, shared expert) | 88.8 | 52–72 GB/s, bound by port 0 (`pmaddubsw`, `pmaddwd`, `mulps`) |
+| Attention | 18.7 | |
+| f32 matmuls (router, hyper-connection mixes) | 11.1 | |
+| Norms, hyper-connections, rope, copies, adds | ~31 | |
+| **Main graph** | **294.5** | |
+| Layers 37–39 and the head, separate graphs | ~45 | |
+| Draft | ~30 | |
+| **Round** | **~382** | 4.68 tokens accepted per round → 12.3 tok/s |
+
+15 tok/s at the same acceptance needs a round of ≤ 312 ms, 70 ms less. The experts cannot go faster on this memory, so the cut would have to come almost entirely from the dense kernel, the small ops and the draft.
+
+### Kept
+
+- **Verify attention shares the K/V conversion across queries** (`fa_multi_patch.py`). The decode attention kernel converted the fp16 K/V rows to f32 once per query. With a mask, the verify queries now walk the union of their visible rows together, with −inf for a row a query cannot see, so each block is converted once for all of them. Attention per verify 20.7 → 15.7–18.7 ms (noisy). `GGML_FA_MQA_MULTI=0` turns it off. `GGML_FA_MQA_MINROWS` sets the chunk floor (default 64; 32 and 16 were no better).
+- **Scheduler: a view of a weight stays with the weight** (`sched_view_weight_patch.py`). A reshaped weight gets its buffer only when the graph is allocated, so the pass-1 check missed it. The op could then land on the GPU and upload the CPU weight on every step.
+- **Profiler fix** (`op_prof_barrier_patch.py`). Threads could run the next node and overwrite their time before thread 0 read it. Small matmuls then looked as if thread 0 did 5–20× the work of the others. It was an artifact: with the fix all threads take the same time.
+- `LLAMA_DECODE_TRACE=1` (`decode_trace_patch.py`): one line per `llama_decode` with tokens, layers and graph time.
+
+### Tried, not kept
+
+- **GPU sidecar for the verify's dense matmuls.** The P2200's Q6_K kernel at 5 columns runs ~250 GMAC/s, below the CPU's ~400–500, and the activations cross PCIe at ~1 GB/s. With `wo_a`/`wo_b` and the shared expert on the GPU, the draft scheduler also ran out of GPU memory.
+- **Fewer threads on the routed experts, the rest on the shared expert.** Expert bandwidth drops with fewer threads (48 threads 114 GB/s, 32 threads 120 GB/s, 64 threads 140), so the overlap loses.
+- **Faster activation quantisation for the small matmuls** (`experiments/q_replica_patch.py`). The quantisation phase took 8–147 µs per matmul (147 µs for `wo_a`'s 40 rows), on the 5 threads that own the 5 token rows. Main-graph time for each variant:
+
+  | Variant | ms |
+  |---|---|
+  | Baseline | 294.5 |
+  | AVX1 quantiser instead of SIMDe's emulated AVX2 | 295.3 |
+  | Split over all 64 threads | 303.5 (`wo_a` faster, every other matmul slower) |
+  | One copy per NUMA node, node-local barrier | 302.3 |
+
+  The cost is moving activations between sockets, not converting them. Spreading the writers out makes every reader fetch from more sockets.
+
+**Known issue:** greedy output is garbage at `-t 32` and `-t 48`, with or without the new attention path. It is older than this round. The server uses 64 threads, where the output is correct.
 
 ## Ideas for cutting the per-token weight read (2026-10-30)
 
@@ -886,7 +947,8 @@ Decode tok/s. The estimates are the ones this plan started with; the measurement
 | + dense part on the GPU | ~12 | slower: −2–5% at `-ngl 0`, −16–19% with layers on the GPU; shared expert alone −13% |
 | + speculative decoding (DSpark), code-like output | ~16–19 (with the GPU) | **10.7** (`n_max=3`), **12.3** (`n_max=4`) |
 | + speculative decoding (DSpark), free prose | | 6.5–6.8 |
-| Prompt processing, pp512 | – | **23.9** CPU only, 26.1 build-cuda `-ngl 0` |
+| Second targets (no purchases): prompts 30, decode 15 | | prompts **35.1** met; decode **12.3** on code, not met (see "Second targets") |
+| Prompt processing, pp512 | – | 23.9 CPU only; **35.1** build-cuda `-ngl 0` with attention on the GPU and the dense shard pinned |
 
 - The GPU plan assumed the P2200 would add bandwidth. The CPU kernels doubled in speed instead, and each CPU↔GPU hand-off in ggml costs 100–165 µs, so offloading anything per token now loses.
 - Speculative decoding gives ×1.45–1.6 on code, about what Phase 4 expected. On prose the draft is accepted too rarely to gain.
